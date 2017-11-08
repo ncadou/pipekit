@@ -28,6 +28,7 @@ pretty straightforward:
     pipe.send('Hello world')
 
     print(pipe.receive())
+    # Hello world
 
     # Pipes are iterables, too:
     for msg in pipe:
@@ -38,5 +39,12 @@ pretty straightforward:
 
     my0mqpipe = ZMQPipe('my-0mq-pipe', address='tcp://*:5555')
 
-.. _Queue: https://docs.python.org/3.5/library/queue.html
+    # Alternatively:
+    from pipekit import Pipe
+
+    my0mqpipe = Pipe('my-0mq-pipe', impl='zmq', address='tcp://*:5555')
+    print(my0mqpipe)
+    # <pipekit.ZMQPipe object at 0x7fe...>
+
+.. _Queue: https://docs.python.org/3/library/queue.html
 .. _0mq: http://zeromq.org/

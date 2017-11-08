@@ -8,10 +8,15 @@ context = zmq.Context()
 
 class Pipe:
     """Message transit mechanism."""
-    def __init__(self, name, address=None):
+    def __new__(cls, *args, **kwargs):
+        cls = PIPE_IMPLEMENTATIONS.get(kwargs.get('impl'), cls)
+        return super().__new__(cls)
+
+    def __init__(self, name, active=True, impl=None, address=None):
         self.name = name
+        self.active = active
+        self.impl = impl
         self.address = address
-        self.active = True
 
     def __iter__(self):
         return self.receiver()
@@ -73,6 +78,9 @@ class ZMQPipe(Pipe):
     def receiver(self):
         while self.active:
             yield self._input.recv()
+
+
+PIPE_IMPLEMENTATIONS = dict(queue=ThreadPipe, zmq=ZMQPipe)
 
 
 class Message:
