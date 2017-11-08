@@ -3,12 +3,14 @@ from queue import Queue
 
 import zmq
 
+context = zmq.Context()
+
 
 class Pipe:
     """Message transit mechanism."""
-    def __init__(self, name, location=None):
+    def __init__(self, name, address=None):
         self.name = name
-        self.location = location
+        self.address = address
         self.active = True
 
     def __iter__(self):
@@ -44,7 +46,7 @@ class ThreadPipe(Pipe):
 
 
 class ZMQPipe(Pipe):
-    def __init__(self, name, context, **kwargs):
+    def __init__(self, name, context=context, **kwargs):
         super().__init__(name, **kwargs)
         self.context = context
 
@@ -52,14 +54,14 @@ class ZMQPipe(Pipe):
     def _input(self):
         if self.__input is None:
             self.__input = self.context.socket(zmq.PUSH)
-            self.__input.bind(self.location)
+            self.__input.bind(self.address)
         return self.__input
 
     @property
     def _output(self):
         if self.__output is None:
             self.__output = self.context.socket(zmq.PULL)
-            self.__output.connect(self.location)
+            self.__output.connect(self.address)
         return self.__output
 
     def send(self, message):
