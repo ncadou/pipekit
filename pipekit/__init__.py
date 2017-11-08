@@ -12,10 +12,10 @@ class Pipe:
         cls = PIPE_IMPLEMENTATIONS.get(kwargs.get('impl'), cls)
         return super().__new__(cls)
 
-    def __init__(self, name, active=True, impl=None, address=None):
+    def __init__(self, name, impl=None, active=True, address=None):
         self.name = name
-        self.active = active
         self.impl = impl
+        self.active = active
         self.address = address
 
     def __iter__(self):
@@ -118,7 +118,7 @@ class Node:
         while self.active:
             self.layers = ([self.iqueue.recv] +
                            self.ifilters.ordered() +
-                           self.multiply(self.processor) +
+                           [self.spawn(self.processor)] +
                            self.ofilters.ordered() +
                            [self.oqueue.send])
             messages = self.layers[0]()
@@ -127,7 +127,7 @@ class Node:
             for result in messages:
                 self.acton(result)
 
-    def scale(self, processor):
+    def spawn(self, processor):
         if self.scale == 1:
             return processor
         raise NotImplementedError

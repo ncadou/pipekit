@@ -25,21 +25,30 @@ pretty straightforward:
 
     # Pipes need to be given a name
     mypipe = ThreadPipe('my-pipe')
-    pipe.send('Hello world')
+    mypipe.send('Hello world')
 
-    print(pipe.receive())
+    print(mypipe.receive())
     # Hello world
 
-    # Pipes are iterables, too:
-    for msg in pipe:
+Pipes are iterables, too:
+
+.. code:: python
+
+    for msg in mypipe:
         dosomething(msg)
 
-    # Need a 0mq-based pipe instead?
+Need a 0mq-based pipe instead?
+
+.. code:: python
+
     from pipekit import ZMQPipe
 
     my0mqpipe = ZMQPipe('my-0mq-pipe', address='tcp://*:5555')
 
-    # Alternatively:
+Alternatively:
+
+.. code:: python
+
     from pipekit import Pipe
 
     my0mqpipe = Pipe('my-0mq-pipe', impl='zmq', address='tcp://*:5555')
