@@ -51,21 +51,32 @@ class ThreadPipe(Pipe):
 
 
 class ZMQPipe(Pipe):
-    def __init__(self, name, context=context, **kwargs):
+    PUBSUB = 'pub-sub'
+    PUSHPULL = 'push-pull'
+
+    def __init__(self, name, context=context, mode=PUSHPULL, **kwargs):
         super().__init__(name, **kwargs)
         self.context = context
+        if mode == self.PUSHPULL:
+            self._isocket_type = zmq.PULL
+            self._osocket_type = zmq.PUSH
+        elif mode == self.PUBSUB:
+            self._isocket_type = zmq.SUB
+            self._osocket_type = zmq.PUB
+        else:
+            raise ValueError('Unknown mode %r' % mode)
 
     @property
     def _input(self):
         if not hasattr(self, '_isocket'):
-            self._isocket = self.context.socket(zmq.PULL)
+            self._isocket = self.context.socket(self._isocket_type)
             self._isocket.connect(self.address)
         return self._isocket
 
     @property
     def _output(self):
         if not hasattr(self, '_osocket'):
-            self._osocket = self.context.socket(zmq.PUSH)
+            self._osocket = self.context.socket(self._osocket_type)
             self._osocket.bind(self.address)
         return self._osocket
 
