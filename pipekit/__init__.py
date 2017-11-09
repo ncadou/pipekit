@@ -80,7 +80,12 @@ class ZMQPipe(Pipe):
             yield self._input.recv()
 
 
-PIPE_IMPLEMENTATIONS = dict(queue=ThreadPipe, zmq=ZMQPipe)
+class DevNull(Pipe):
+    def send(self, message, **kwargs):
+        pass
+
+
+PIPE_IMPLEMENTATIONS = dict(queue=ThreadPipe, zmq=ZMQPipe, null=DevNull)
 
 
 class Message:
