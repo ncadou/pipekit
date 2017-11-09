@@ -110,17 +110,24 @@ class Node:
         if callable(process):
             self.process = process
 
-    def start(self, cqueue):
-        """Start control channel listener."""
-        spawn(self.listener, cqueue)
+    def reader(self):
+        while self.active:
+            for msg in self.inbox:
+                yield 'default', msg
+
+    def writer(self, inbox):
+        while self.active:
+            for channel, msg in inbox:
+                self.outbox.send(msg)
+                yield channel, msg
 
     def run(self):
         while self.active:
-            self.layers = ([self.inbox] +
+            self.layers = ([self.reader] +
                            self.ifilters.ordered() +
                            [self.spawn(self.processor)] +
                            self.ofilters.ordered() +
-                           [self.outbox])
+                           [self.writer])
             messages = self.layers[0]()
             for layer in self.layers[1:]:
                 messages = layer(messages)
