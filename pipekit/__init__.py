@@ -31,7 +31,7 @@ class Pipe:
 class ThreadPipe(Pipe):
     @property
     def _input(self):
-        if self._queue is None:
+        if not hasattr(self, '_queue'):
             self._queue = Queue()
         return self._queue
 
@@ -39,15 +39,15 @@ class ThreadPipe(Pipe):
     def _output(self):
         return self._input
 
-    def send(self, message):
-        self._queue.put(message)
+    def send(self, message, wait=True):
+        self._output.put(message, wait)
 
     def receive(self, wait=True):
-        return self._queue.get(wait)
+        return self._input.get(wait)
 
     def receiver(self):
         while self.active:
-            yield self._queue.get()
+            yield self._input.get()
 
 
 class ZMQPipe(Pipe):
@@ -57,20 +57,20 @@ class ZMQPipe(Pipe):
 
     @property
     def _input(self):
-        if self.__input is None:
-            self.__input = self.context.socket(zmq.PUSH)
-            self.__input.bind(self.address)
-        return self.__input
+        if not hasattr(self, '_isocket'):
+            self._isocket = self.context.socket(zmq.PULL)
+            self._isocket.connect(self.address)
+        return self._isocket
 
     @property
     def _output(self):
-        if self.__output is None:
-            self.__output = self.context.socket(zmq.PULL)
-            self.__output.connect(self.address)
-        return self.__output
+        if not hasattr(self, '_osocket'):
+            self._osocket = self.context.socket(zmq.PUSH)
+            self._osocket.bind(self.address)
+        return self._osocket
 
-    def send(self, message):
-        self._output.send(message)
+    def send(self, message, wait=True):
+        self._output.send(message, 0 if wait else zmq.NOBLOCK)
 
     def receive(self, wait=True):
         return self._input.recv(0 if wait else zmq.NOBLOCK)
@@ -98,14 +98,14 @@ class Manager:
 class Node:
     """Processes messages."""
     def __init__(self, name, process=None, scale=1, active=True,
-                 iqueue=None, ifilters=None, ofilters=None, oqueue=None):
+                 inbox=None, ifilters=None, ofilters=None, outbox=None):
         self.name = name
         self.scale = scale
         self.active = active
-        self.iqueue = iqueue
+        self.inbox = inbox
         self.ifilters = ifilters or PriorityRegistry()
         self.ofilters = ofilters or PriorityRegistry()
-        self.oqueue = oqueue
+        self.outbox = outbox
         self.layers = list()
         if callable(process):
             self.process = process
@@ -116,11 +116,11 @@ class Node:
 
     def run(self):
         while self.active:
-            self.layers = ([self.iqueue.recv] +
+            self.layers = ([self.inbox] +
                            self.ifilters.ordered() +
                            [self.spawn(self.processor)] +
                            self.ofilters.ordered() +
-                           [self.oqueue.send])
+                           [self.outbox])
             messages = self.layers[0]()
             for layer in self.layers[1:]:
                 messages = layer(messages)
