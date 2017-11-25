@@ -7,6 +7,9 @@ with codecs.open('README.rst', encoding='utf-8') as f:
     long_description = f.read()
 
 install_requires = [
+    'aiozmq',
+    'async_generator',
+    'janus',
     'pyzmq',
 ]
 
@@ -23,8 +26,7 @@ setup(
         'Intended Audience :: Developers',
         'Topic :: Office/Business :: Scheduling',
         'License :: MIT',
-        'Programming Language :: Python :: 2.7'
-        'Programming Language :: Python :: 2.5'
+        'Programming Language :: Python :: 3.5'
     ],
     keywords='pipe pipeline queue topology flow based programming',
     packages=find_packages(exclude=['contrib', 'docs', 'tests*']),

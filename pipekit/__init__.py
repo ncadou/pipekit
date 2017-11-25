@@ -1,38 +1,86 @@
+import asyncio
+import types
 from collections import defaultdict
+from concurrent import futures
 from queue import Queue
+from threading import Thread
 
+import aiozmq
+import janus
 import zmq
+from async_generator import async_generator, yield_, yield_from_
+from zmq.asyncio import Context
 
-context = zmq.Context()
+EOT = '.EOT'
+
+zcontext = Context.instance()
 
 
-class Pipe:
-    """Message transit mechanism."""
-    def __new__(cls, *args, **kwargs):
-        cls = PIPE_IMPLEMENTATIONS.get(kwargs.get('impl'), cls)
-        return super().__new__(cls)
+class LogUtil:
+    def log(self, message):
+        print('%s %s' % (self, message))
 
-    def __init__(self, name, impl=None, active=True, address=None):
-        self.name = name
-        self.impl = impl
-        self.active = active
-        self.address = address
 
-    def __iter__(self):
-        return self.receiver()
+class Runnable():
+    def __init__(self, *args, **kwargs):
+        self.active = kwargs.pop('active', True)
 
     def start(self):
+        self.log('Starting')
         self.active = True
+        return self.run()
 
     def stop(self):
+        self.log('Stopping')
         self.active = False
+
+    async def run(self):
+        pass
+
+
+class Pipe(Runnable, LogUtil):
+    """Message transit mechanism."""
+    EOT = '__eot__'
+
+    def __new__(cls, *args, **kwargs):
+        cls = PIPETYPES.get(kwargs.get('impl'), cls)
+        return super().__new__(cls)
+
+    def __init__(self, name=None, impl=None, address=None, **kwargs):
+        super().__init__(**kwargs)
+        self.name = name
+        self.impl = impl
+        self.address = address
+        self.log('Initialized')
+
+    def __aiter__(self):
+        return self.receiver()
+
+    def __str__(self):
+        return '<%s %r>' % (self.__class__.__name__, self.name)
+
+    # def start(self):
+    #     self.log('Starting')
+    #     self.active = True
+    #     if hasattr(self, '_start'):
+    #         return self._start()
+
+    # def stop(self):
+    #     self.log('Stopping')
+    #     self.active = False
+    #     if hasattr(self, '_stop'):
+    #         return self._stop()
+
+    # @property
+    # def run(self):
+    #     return asyncio.coroutine(lambda: None)
 
 
 class ThreadPipe(Pipe):
     @property
     def _input(self):
         if not hasattr(self, '_queue'):
-            self._queue = Queue()
+            self._queue = Queue(maxsize=1)
         return self._queue
 
     @property
@@ -40,27 +88,122 @@ class ThreadPipe(Pipe):
         return self._input
 
     def send(self, message, wait=True):
+        self.log('Sending')
         self._output.put(message, wait)
 
     def receive(self, wait=True):
+        self.log('Receiving')
         return self._input.get(wait)
 
     def receiver(self):
         while self.active:
+            self.log('Receiving+')
+            yield self._input.get()
+
+
+class JanusPipe(Pipe):
+    INPUT_IS_SYNC = '.INPUT_IS_SYNC'
+    INPUT_IS_ASYNC = '.INPUT_IS_ASYNC'
+
+    def __init__(self, name=None, mode=INPUT_IS_SYNC, *args, **kwargs):
+        super().__init__(name, *args, **kwargs)
+        assert mode in (self.INPUT_IS_ASYNC, self.INPUT_IS_SYNC)
+        self._queue = janus.Queue(maxsize=1)
+        self.receiver = AsyncQueueIterator(self._queue.async_q)
+        if mode == self.INPUT_IS_ASYNC:
+            self.send, self.receive, self.receiver = (
+                self._async_send, self._sync_receive, self._sync_receiver)
+
+    async def _async_send(self, message, wait=True):
+        self.log('Sending')
+        if wait:
+            await self._queue.async_q.put(message)
+        else:
+            await self._queue.async_q.put_nowait(message)
+
+    def send(self, message, wait=True):
+        self.log('Sending')
+        self._queue.sync_q.put(message, wait)
+
+    def _sync_receive(self, wait=True):
+        self.log('Receiving')
+        return self._queue.sync_q.get(wait)
+
+    async def receive(self, wait=True):
+        self.log('Receiving')
+        if wait:
+            return await self._queue.async_q.get()
+        else:
+            return await self._queue.async_q.get_nowait()
+
+    def _sync_receiver(self):
+        while self.active:
+            self.log('Receiving+')
             yield self._input.get()
 
 
 class ZMQPipe(Pipe):
-    PUBSUB = 'pub-sub'
-    PUSHPULL = 'push-pull'
+    PUB_SUB = '.PUB_SUB'
+    PUSH_PULL = '.PUSH_PULL'
+    SENDER = '.SENDER'
+    RECEIVER = '.RECEIVER'
 
-    def __init__(self, name, context=context, mode=PUSHPULL, **kwargs):
+    def __init__(self, name, zcontext=zcontext, type_=None, mode=PUSH_PULL,
+                 **kwargs):
         super().__init__(name, **kwargs)
-        self.context = context
-        if mode == self.PUSHPULL:
+        self.zcontext = zcontext
+        self.type_ = type_
+        self.mode = mode
+
+    _modes = {
+        PUSH_PULL: {
+            RECEIVER: dict(mode=zmq.PULL, method='connect'),
+            SENDER: dict(mode=zmq.PUSH, method='bind')},
+        PUB_SUB: {
+            RECEIVER: dict(mode=zmq.SUB, method='connect'),
+            SENDER: dict(mode=zmq.PUB, method='bind')}}
+
+    @asyncio.coroutine
+    def _create_socket(self, type_, mode):
+        return (yield from aiozmq.create_zmq_stream(
+            type_, **{mode: self.address}))
+        # high_read, high_write, low_read, low_write
+
+    async def run(self):
+        self._socket = await self._create_socket(
+            self._modes[self.mode][self.type_]['mode'],
+            self._modes[self.mode][self.type_]['method'])
+        self.log('Socket [%s, %s] created' % (self.mode, self.type_))
+
+    async def send(self, message, wait=False):
+        self.log('Sending')
+        if wait:
+            raise NotImplementedError
+        self._socket.write((message,))
+
+    @asyncio.coroutine
+    def receive(self, wait=True):
+        self.log('Receiving')
+        yield (yield from self._input.recv(0 if wait else zmq.NOBLOCK))
+
+    @asyncio.coroutine
+    def receiver(self):
+        while self.active:
+            self.log('Receiving+')
+            yield (yield from self._input.recv())
+
+
+class PyZMQPipe(Pipe):
+    PUB_SUB = '.PUB_SUB'
+    PUSH_PULL = '.PUSH_PULL'
+
+    def __init__(self, name, zcontext=zcontext, mode=PUSH_PULL, **kwargs):
+        super().__init__(name, **kwargs)
+        self.zcontext = zcontext
+        if mode == self.PUSH_PULL:
             self._isocket_type = zmq.PULL
             self._osocket_type = zmq.PUSH
-        elif mode == self.PUBSUB:
+        elif mode == self.PUB_SUB:
             self._isocket_type = zmq.SUB
             self._osocket_type = zmq.PUB
         else:
@@ -69,26 +212,31 @@ class ZMQPipe(Pipe):
     @property
     def _input(self):
         if not hasattr(self, '_isocket'):
-            self._isocket = self.context.socket(self._isocket_type)
+            self._isocket = self.zcontext.socket(self._isocket_type)
             self._isocket.connect(self.address)
         return self._isocket
 
     @property
     def _output(self):
         if not hasattr(self, '_osocket'):
-            self._osocket = self.context.socket(self._osocket_type)
+            self._osocket = self.zcontext.socket(self._osocket_type)
             self._osocket.bind(self.address)
         return self._osocket
 
-    def send(self, message, wait=True):
-        self._output.send(message, 0 if wait else zmq.NOBLOCK)
+    async def send(self, message, wait=True):
+        self.log('Sending')
+        await self._output.send(message, 0 if wait else zmq.NOBLOCK)
 
+    @asyncio.coroutine
     def receive(self, wait=True):
-        return self._input.recv(0 if wait else zmq.NOBLOCK)
+        self.log('Receiving')
+        yield (yield from self._input.recv(0 if wait else zmq.NOBLOCK))
 
+    @asyncio.coroutine
     def receiver(self):
         while self.active:
-            yield self._input.recv()
+            self.log('Receiving+')
+            yield (yield from self._input.recv())
 
 
 class DevNull(Pipe):
@@ -96,75 +244,186 @@ class DevNull(Pipe):
         pass
 
 
-PIPE_IMPLEMENTATIONS = dict(queue=ThreadPipe, zmq=ZMQPipe, null=DevNull)
+PIPETYPES = dict(janus=JanusPipe, queue=ThreadPipe, zmq=ZMQPipe, null=DevNull)
 
 
-class Message:
-    """Represents a data unit moving through the system."""
+class AsyncQueueIterator(LogUtil):
+    def __init__(self, queue):
+        self.queue = queue
+        self.log('Initialized')
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.log('Waiting')
+        message = await self.queue.get()
+        self.log('Got %r' % (message,))
+        self.queue.task_done()
+        if message == EOT:
+            self.count -= 1
+            if self.count == 0:
+                await self.queue.join()
+                raise StopAsyncIteration
+        self.log('Returning %r' % (message,))
+        return message
+        if not self.manifold.active:
+            raise StopAsyncIteration
 
 
-class Builder:
-    """Connects nodes using pipes."""
+class Collector(AsyncQueueIterator):
+    def __init__(self, manifold):
+        self.manifold = manifold
+        self.count = len(manifold.channels)
+        self.name = '%s-collector' % manifold.name
+        super().__init__(manifold.collector)
 
 
-class Manager:
-    """Uses builders to create and morph a topology."""
+class Manifold(Pipe):
+    def __init__(self, name='manifold', buffersize=1, **channels):
+        self.buffersize = buffersize
+        self.channels = channels
+        super().__init__(name)
+
+    def __str__(self):
+        return '<%s [%s]>' % (self.__class__.__name__,
+                              ', '.join('%s:%s' % (n, p.name)
+                                        for n, p in self.channels.items()))
 
 
-class Node:
+class Inbox(Manifold):
+    def run(self):
+        feeds = dict()
+        self.collector = asyncio.Queue(maxsize=self.buffersize)
+        for name in self.channels:
+            feeds[name] = self._feed(name, self.channels[name], self.collector)
+            self.log('Created feed %s' % name)
+        runnables = [pipe.start() for pipe in self.channels.values()]
+        runnables += feeds.values()
+        print(repr(runnables))
+        return asyncio.gather(*runnables)
+
+    # async def _feed(self, name, pipe, collector):
+    #     while self.active:
+    #         self.log('Waiting for pipe %s' % name)
+    #         await collector.put((name, await pipe.receive()))
+
+    async def _feed(self, name, pipe, collector):
+        message = None
+        while self.active and message != EOT:
+            self.log('Waiting for pipe %s' % name)
+            self.log('pipe.receive: %r' % pipe.receive)
+            message = await pipe.receive()
+            self.log('Pipe %s gave %r' % (name, message))
+            await collector.put((name, message))
+            self.log('Sent %r to collector' % message)
+        self.log('Exiting')
+
+    # # @types.coroutine
+    # def receive(self):
+    #     self.log('Waiting for collector')
+    #     return (yield from self.collector.get())
+
+    # # @types.coroutine
+    # def receiver(self):
+    #     while self.active:
+    #         self.log('Waiting for collector+')
+    #         get = self.collector.get()
+    #         print(get.__class__)
+    #         print(get.func)
+    #         print(asyncio.isfuture(get))
+    #         print(asyncio.isfuture(get.func))
+    #         print(next(get))
+    #         fut = asyncio.wait(get, return_when=futures.ALL_COMPLETED)
+    #         print(repr(fut))
+    #         1/0
+    #         # message = (yield from get)
+    #         self.log('Collector yielded %s' % message)
+    #         yield message
+
+    def receiver(self):
+        return Collector(self)
+
+
+class Outbox(Manifold):
+    def run(self):
+        runnables = [pipe.start() for pipe in self.channels.values()]
+        print(repr(runnables))
+        return asyncio.gather(*runnables)
+
+    @async_generator
+    async def send(self, messages):
+        self.log('Ready to send')
+        async for channel, message in messages:
+            self.log('Sending to %s' % channel)
+            await self.channels[channel].send(message)
+            await yield_((channel, message))
+
+
+class Node(Runnable, LogUtil):
     """Processes messages."""
     def __init__(self, name, process=None, scale=1, active=True,
                  inbox=None, ifilters=None, ofilters=None, outbox=None):
         self.name = name
-        self.scale = scale
-        self.active = active
-        self.inbox = inbox
-        self.ifilters = ifilters or PriorityRegistry()
-        self.ofilters = ofilters or PriorityRegistry()
-        self.outbox = outbox
-        self.layers = list()
+        self.log('Initializing')
         if callable(process):
             self.process = process
+        self.scale = scale
+        self.active = active
+        self.inbox = self._join(inbox, Inbox)
+        self.ifilters = ifilters or PriorityRegistry()
+        self.ofilters = ofilters or PriorityRegistry()
+        self.outbox = self._join(outbox, Outbox)
+        self.layers = list()
+        self.log('Initialized')
 
-    def reader(self):
-        while self.active:
-            for msg in self.inbox:
-                yield 'default', msg
+    def __str__(self):
+        return '<%s %r>' % (self.__class__.__name__, self.name)
 
-    def writer(self, inbox):
-        while self.active:
-            for channel, msg in inbox:
-                self.outbox.send(msg)
-                yield channel, msg
+    def _join(self, pipe, class_):
+        if callable(getattr(pipe, 'items', None)):
+            self.log('Wrapping %r in %s' % (pipe, class_))
+            pipe = class_(**pipe)
+        elif not isinstance(pipe, Manifold):
+            self.log('Wrapping %r in single %s' % (pipe, class_))
+            pipe = class_(default=pipe)
+        return pipe
 
-    def run(self):
+    def start(self):
+        self.layers = ([self.inbox] +
+                       self.ifilters.ordered() +
+                       [self.spawn(self.processor)] +
+                       self.ofilters.ordered() +
+                       [self.outbox.send])
+        runnables = [super().start()]
+        for layer in self.layers:
+            if callable(getattr(layer, 'start', None)):
+                runnables.append(layer.start())
+        return asyncio.gather(*runnables)
+
+    async def run(self):
+        self.log('Spinning')
         while self.active:
-            self.layers = ([self.reader] +
-                           self.ifilters.ordered() +
-                           [self.spawn(self.processor)] +
-                           self.ofilters.ordered() +
-                           [self.writer])
-            messages = self.layers[0]()
+            chain = self.layers[0]
             for layer in self.layers[1:]:
-                messages = layer(messages)
-            for result in messages:
-                self.acton(result)
+                chain = layer(chain)
+            self.log('Consuming messages')
+            async for result in chain:
+                pass
 
     def spawn(self, processor):
         if self.scale == 1:
             return processor
         raise NotImplementedError
 
-    def processor(self, inbox):
-        for channel, msg in inbox:
-            channel, msg = self.process(channel, msg)
-            yield channel, msg
+    def processor(self, messages):
+        for channel, message in messages:
+            channel, message = self.process(channel, message)
+            yield channel, message
 
-    def process(self, channel, msg):
+    def process(self, channel, message):
         raise NotImplementedError
 
-    def acton(self, result):
-        pass
 
 
 class Joiner:
@@ -179,12 +438,13 @@ class Joiner:
         self.node = node
         self.groups = defaultdict(dict)
         self.totals = defaultdict(lambda: None)
+        self.log('Initialized')
 
     def __call__(self, messages):
-        for prefix, msg in messages:
-            op = msg.checkpoints.get(self.node.name)
+        for prefix, message in messages:
+            op = message.checkpoints.get(self.node.name)
             if op and op.type == 'join':
-                self.groups[op.id][msg.id] = msg
+                self.groups[op.id][message.id] = message
                 if op.total:
                     self.totals[op.id] = op.total
                 total = self.totals[op.id]
@@ -194,29 +454,7 @@ class Joiner:
                     else:
                         continue
             else:
-                yield prefix, msg
-
-
-class Channels:
-    def __init__(self, channels):
-        self.channels = channels
-
-    def feed(self, name, outbox):
-        for msg in self.channels[name].recv():
-            outbox.send((name, msg))
-
-    def recv(self):
-        outbox = Pipe()
-        for name in self.channels:
-            feeds[name] = spawn(self.feed, name, outbox)
-        for channel, msg in outbox.recv():
-            yield channel, msg
-        for name in self.channels:
-            feeds[name].join()
-
-    def send(self, channel, msg):
-        self.channels[channel].send(msg)
-        yield channel, msg
+                yield prefix, message
 
 
 class PriorityRegistry(dict):
