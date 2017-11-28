@@ -18,7 +18,7 @@ zcontext = Context.instance()
 
 class LogUtil:
     def log(self, message):
-        print('%s %s' % (self, message))
+        print('%s %s' % (self, message.encode()))
 
 
 class Runnable():
@@ -170,6 +170,7 @@ class ZMQPipe(Pipe):
         # high_read, high_write, low_read, low_write
 
     async def run(self):
+        self.log('Running')
         self._socket = await self._create_socket(
             self._modes[self.mode][self.type_]['mode'],
             self._modes[self.mode][self.type_]['method'])
@@ -293,13 +294,12 @@ class Manifold(Pipe):
 
 class Inbox(Manifold):
     def run(self):
-        feeds = dict()
         self.collector = asyncio.Queue(maxsize=self.buffersize)
-        for name in self.channels:
-            feeds[name] = self.feed(name, self.channels[name], self.collector)
-            self.log('Created feed %s' % name)
         runnables = [pipe.start() for pipe in self.channels.values()]
-        runnables += feeds.values()
+        for name in self.channels:
+            runnables.append(
+                self.feed(name, self.channels[name], self.collector))
+            self.log('Created feed %s' % name)
         print(repr(runnables))
         return asyncio.gather(*runnables)
 
@@ -346,13 +346,16 @@ class Inbox(Manifold):
 
 
 class Outbox(Manifold):
+    def __call__(self, messages):
+        return self.sender(messages)
+
     def run(self):
         runnables = [pipe.start() for pipe in self.channels.values()]
         print(repr(runnables))
         return asyncio.gather(*runnables)
 
     @async_generator
-    async def send(self, messages):
+    async def sender(self, messages):
         self.log('Ready to send')
         async for channel, message in messages:
             self.log('Sending to %s' % channel)
@@ -394,7 +397,7 @@ class Node(Runnable, LogUtil):
                        self.ifilters.ordered() +
                        [self.spawn(self.processor)] +
                        self.ofilters.ordered() +
-                       [self.outbox.send])
+                       [self.outbox])
         runnables = [super().start()]
         for layer in self.layers:
             if isinstance(layer, Runnable):
@@ -417,7 +420,7 @@ class Node(Runnable, LogUtil):
         raise NotImplementedError
 
     @async_generator
-    def processor(self, messages):
+    async def processor(self, messages):
         for channel, message in messages:
             channel, message = await self.process(channel, message)
             await yield_((channel, message))
@@ -431,7 +434,7 @@ class Filter(Runnable, LogUtil):
         return self.filter(messages)
 
     @async_generator
-    def filter(self, messages):
+    async def filter(self, messages):
         for message in messages:
             raise NotImplementedError
             await yield_(message)
@@ -439,54 +442,80 @@ class Filter(Runnable, LogUtil):
 
 class Batcher(Filter):
     _RELEASE = '.release'
+    _DEFAULT = '.default'
+
+    def __init__(self, settings, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.settings = settings
 
     def initialize(self):
         self.batches = defaultdict(lambda: dict(data=list()))
-        # TODO: populate self.batches based on settings
+        for key, settings in self.settings.items():
+            self.batches[key].update(**settings)
+            # TODO: populate self.keyfn based on settings
+            self.keyfn = defaultdict(lambda: lambda msg: msg)
 
     def start(self):
         self.initialize()
         self.feed = asyncio.Queue(maxsize=1)
-        runnables = [super().start(), self.feeder()]
-        for key, batch in self.batches.iteritems():
+        runnables = [super().start(), self.batcher()]
+        for key, batch in self.batches.items():
             batch['alarm'] = asyncio.Queue(maxsize=1)
             runnables.append(self.timer(key))
         return asyncio.gather(*runnables)
 
     @async_generator
-    def filter(self, messages):
+    async def filter(self, messages):
+        self.log('Waiting for messages')
         await self.feed.put(messages)
         await self.feed.join()
+        self.log('Listening for batch releases')
         while self.active:
             channel, message = await self.feed.get()
+            self.log('Got batch')
             if channel == self._RELEASE:
-                channel, message = prepare(message)  # TODO
-            await yield_(channel, message)
+                print(message)
+                # channel, message = prepare(message)  # TODO
+                channel, message = message['data'][0]
+            print(channel, message)
+            await yield_((channel, message))
             self.feed.task_done()
 
-    async def feeder(self):
+    async def batcher(self):
         messages = await self.feed.get()
         self.feed.task_done()
+        self.log('Got messages')
         async for channel, message in messages:
-            batch = self.batches[makekey(channel, message)]  # TODO
-            if 'settings' in batch:
+            self.log('Got message')
+            batch = self.batches[self.keyfn[channel](message)]
+            if 'alarm' in batch:
                 # TODO: handle optional deduplication
                 batch['data'].append((channel, message))
                 if len(batch['data']) == batch['maxsize']:
+                    self.log('Releasing full batch')
                     await self.release(batch)
                 elif len(batch['data']) == 1:
-                    await batch['alarm'].put(None)
+                    self.log('Setting alarm')
+                    await batch['alarm'].put(self._DEFAULT)
             else:
+                self.log('Unknown batch')
                 await self.feed.put((channel, message))
         await self.feed.join()
 
     async def timer(self, key):
+        from datetime import datetime
         batch = self.batches[key]
         while self.active:
-            delay = await batch['alarm'].get() or batch['maxtime']
-            asyncio.sleep(delay)
+            self.log('Timer %s ready' % key)
+            delay = await batch['alarm'].get()
+            if delay == self._DEFAULT:
+                 delay = batch['maxtime']
+            self.log('Timer %s starting (%s s)' % (key, delay))
+            await asyncio.sleep(delay)
+            self.log('Timer %s is up' % key)
             batch['alarm'].task_done()
             if batch['data']:
+                self.log('Timer %s releasing batch' % key)
                 await self.release(batch)
         await self.feed.join()
 
@@ -494,7 +523,7 @@ class Batcher(Filter):
         data = batch['data']
         batch['data'] = list()
         batch = batch.copy()
-        batch.update(data=data)
+        batch['data'] = data
         await self.feed.put((self._RELEASE, batch))
 
 
