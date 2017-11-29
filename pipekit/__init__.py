@@ -40,8 +40,6 @@ class Runnable():
 
 class Pipe(Runnable, LogUtil):
     """Message transit mechanism."""
-    EOT = '__eot__'
-
     def __new__(cls, *args, **kwargs):
         cls = PIPETYPES.get(kwargs.get('impl'), cls)
         return super().__new__(cls)
@@ -58,22 +56,6 @@ class Pipe(Runnable, LogUtil):
 
     def __str__(self):
         return '<%s %r>' % (self.__class__.__name__, self.name)
-
-    # def start(self):
-    #     self.log('Starting')
-    #     self.active = True
-    #     if hasattr(self, '_start'):
-    #         return self._start()
-
-    # def stop(self):
-    #     self.log('Stopping')
-    #     self.active = False
-    #     if hasattr(self, '_stop'):
-    #         return self._stop()
-
-    # @property
-    # def run(self):
-    #     return asyncio.coroutine(lambda: None)
 
 
 class ThreadPipe(Pipe):
@@ -167,7 +149,6 @@ class ZMQPipe(Pipe):
     def _create_socket(self, type_, mode):
         return (yield from aiozmq.create_zmq_stream(
             type_, **{mode: self.address}))
-        # high_read, high_write, low_read, low_write
 
     async def run(self):
         self.log('Running')
@@ -303,11 +284,6 @@ class Inbox(Manifold):
         print(repr(runnables))
         return asyncio.gather(*runnables)
 
-    # async def feed(self, name, pipe, collector):
-    #     while self.active:
-    #         self.log('Waiting for pipe %s' % name)
-    #         await collector.put((name, await pipe.receive()))
-
     async def feed(self, name, pipe, collector):
         message = None
         while self.active and message != EOT:
@@ -318,28 +294,6 @@ class Inbox(Manifold):
             await collector.put((name, message))
             self.log('Sent %r to collector' % message)
         self.log('Exiting')
-
-    # # @types.coroutine
-    # def receive(self):
-    #     self.log('Waiting for collector')
-    #     return (yield from self.collector.get())
-
-    # # @types.coroutine
-    # def receiver(self):
-    #     while self.active:
-    #         self.log('Waiting for collector+')
-    #         get = self.collector.get()
-    #         print(get.__class__)
-    #         print(get.func)
-    #         print(asyncio.isfuture(get))
-    #         print(asyncio.isfuture(get.func))
-    #         print(next(get))
-    #         fut = asyncio.wait(get, return_when=futures.ALL_COMPLETED)
-    #         print(repr(fut))
-    #         1/0
-    #         # message = (yield from get)
-    #         self.log('Collector yielded %s' % message)
-    #         yield message
 
     def receiver(self):
         return Collector(self)
