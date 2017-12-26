@@ -1,7 +1,11 @@
+# encoding: utf-8
+
 import asyncio
+import sys
 import types
 from collections import defaultdict
 from concurrent import futures
+from datetime import datetime
 from queue import Queue
 from threading import Thread
 
@@ -11,23 +15,27 @@ import zmq
 from async_generator import async_generator, yield_, yield_from_
 from zmq.asyncio import Context
 
-EOT = '.EOT'
-
 zcontext = Context.instance()
+
+EOT = (None, b'EOT')
 
 
 class LogUtil:
     def log(self, message):
-        print('%s %s' % (self, message.encode()))
+        try:
+            print('%s %s' % (self, message))
+        except UnicodeError:
+            print('%s %s' % (self, message.encode()))
 
 
 class Runnable():
     def __init__(self, *args, **kwargs):
         self.active = kwargs.pop('active', True)
 
-    def start(self):
+    def start(self, loop):
         self.log('Starting')
         self.active = True
+        self.loop = loop
         return self.run()
 
     def stop(self):
@@ -58,40 +66,144 @@ class Pipe(Runnable, LogUtil):
         return '<%s %r>' % (self.__class__.__name__, self.name)
 
 
-class ThreadPipe(Pipe):
-    @property
-    def _input(self):
-        if not hasattr(self, '_queue'):
-            self._queue = Queue(maxsize=1)
-        return self._queue
+class DevNull(Pipe):
+    def send(self, message, **kwargs):
+        pass
 
-    @property
-    def _output(self):
-        return self._input
 
-    def send(self, message, wait=True):
-        self.log('Sending')
-        self._output.put(message, wait)
+class QueueIterator(LogUtil):
+    def __init__(self, queue):
+        self.queue = queue
+        self.log('Initialized')
 
-    def receive(self, wait=True):
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        message = await self.queue.get()
+        self.queue.task_done()
+        if message == EOT:
+            self.stop()
+            await self.queue.join()
+            raise StopAsyncIteration
+
+        return message
+
+
+class QueuePipe(Pipe, QueueIterator):
+    def __init__(self, name, queue=None, maxsize=1, *args, **kwargs):
+        Pipe.__init__(self, name, *args, **kwargs)
+        QueueIterator.__init__(self, queue or asyncio.Queue(maxsize=maxsize))
+
+    async def receive(self, wait=True):
         self.log('Receiving')
-        return self._input.get(wait)
+        if not wait:
+            raise NotImplementedError
+        try:
+            return await self.__anext__()
 
-    def receiver(self):
+        except StopAsyncIteration:
+            return EOT
+
+    @async_generator
+    async def receiver(self):
         while self.active:
             self.log('Receiving+')
-            yield self._input.get()
+            await yield_(await self.receive())
+
+
+class FilePipe(QueuePipe):
+    def __init__(self, name, fileobj, *args, **kwargs):
+        super().__init__(name, *args, **kwargs)
+        self._fileobj = fileobj
+
+    async def run(self):
+        self.loop.add_reader(self._fileobj.fileno(), self._reader)
+
+    def _reader(self):
+        line = self._fileobj.readline()
+        if not line:  # EOF
+            self.loop.remove_reader(self._fileobj.fileno())
+            line = EOT
+        asyncio.ensure_future(self.queue.put(line), loop=self.loop)
+
+
+class ThreadPipe(QueuePipe):
+    def __init__(self, name, queue=None, maxsize=1, *args, **kwargs):
+        queue = queue or Queue(maxsize=maxsize)
+        super().__init__(name, queue=queue, *args, **kwargs)
+
+
+class TCPPipe(Pipe):
+    def __init__(self, name, maxsize=1024**2, **kwargs):
+        super().__init__(name, **kwargs)
+        self.maxsize = maxsize
+
+    async def run(self):
+        host, port = (self.address.split(':') + [None])[:2]
+        if not port:
+            host, port = '0.0.0.0', host
+        self._reader, self._writer = await asyncio.open_connection(
+            host=host, port=port, loop=self.loop, limit=self.maxsize)
+        self.log('TCP socket about to be created: %s' % self.address)
+
+    async def _get(self, attr):
+        attr = '_%s' % attr
+        while self.active and not hasattr(self, attr):
+            await asyncio.sleep(0.01)
+        return getattr(self, attr)
+
+    async def send(self, message, wait=False):
+        # self.log('Sending')
+        if wait:
+            raise NotImplementedError
+
+        writer = await self._get('writer')
+        writer.write(message)
+
+    async def receive(self, wait=True):
+        # self.log('Receiving')
+        reader = await self._get('reader')
+        if not wait:
+            raise NotImplementedError
+
+        line = await reader.readline()
+        if not line:  # EOF
+            reader.feed_eof()
+            self.stop()
+            line = EOT
+        else:
+            line = line.decode()
+        return line
+
+    @async_generator
+    async def receiver(self):
+        reader = await self._get('reader')
+        while self.active:
+            # self.log('Receiving+')
+            await yield_(await self.receive())
+
+
+class PulsePipe(QueuePipe):
+    def __init__(self, name, delay, *args, **kwargs):
+        super().__init__(name, *args, **kwargs)
+        self.delay = delay
+
+    async def run(self):
+        while self.active:
+            await asyncio.sleep(self.delay)
+            await self.queue.put(datetime.now())
 
 
 class JanusPipe(Pipe):
-    INPUT_IS_SYNC = '.INPUT_IS_SYNC'
-    INPUT_IS_ASYNC = '.INPUT_IS_ASYNC'
+    INPUT_IS_SYNC = b'INPUT_IS_SYNC'
+    INPUT_IS_ASYNC = b'INPUT_IS_ASYNC'
 
     def __init__(self, name=None, mode=INPUT_IS_SYNC, *args, **kwargs):
         super().__init__(name, *args, **kwargs)
         assert mode in (self.INPUT_IS_ASYNC, self.INPUT_IS_SYNC)
         self._queue = janus.Queue(maxsize=1)
-        self.receiver = AsyncQueueIterator(self._queue.async_q)
+        self.receiver = QueueIterator(self._queue.async_q)
         if mode == self.INPUT_IS_ASYNC:
             self.send, self.receive, self.receiver = (
                 self._async_send, self._sync_receive, self._sync_receiver)
@@ -108,11 +220,11 @@ class JanusPipe(Pipe):
         self._queue.sync_q.put(message, wait)
 
     def _sync_receive(self, wait=True):
-        self.log('Receiving')
+        # self.log('Receiving')
         return self._queue.sync_q.get(wait)
 
     async def receive(self, wait=True):
-        self.log('Receiving')
+        # self.log('Receiving')
         if wait:
             return await self._queue.async_q.get()
         else:
@@ -120,20 +232,18 @@ class JanusPipe(Pipe):
 
     def _sync_receiver(self):
         while self.active:
-            self.log('Receiving+')
+            # self.log('Receiving+')
             yield self._input.get()
 
 
 class ZMQPipe(Pipe):
-    PUB_SUB = '.PUB_SUB'
-    PUSH_PULL = '.PUSH_PULL'
-    SENDER = '.SENDER'
-    RECEIVER = '.RECEIVER'
+    PUB_SUB = b'PUB_SUB'
+    PUSH_PULL = b'PUSH_PULL'
+    SENDER = b'SENDER'
+    RECEIVER = b'RECEIVER'
 
-    def __init__(self, name, zcontext=zcontext, type_=None, mode=PUSH_PULL,
-                 **kwargs):
+    def __init__(self, name, type_=None, mode=PUSH_PULL, **kwargs):
         super().__init__(name, **kwargs)
-        self.zcontext = zcontext
         self.type_ = type_
         self.mode = mode
 
@@ -155,41 +265,52 @@ class ZMQPipe(Pipe):
         self._socket = await self._create_socket(
             self._modes[self.mode][self.type_]['mode'],
             self._modes[self.mode][self.type_]['method'])
-        self.log('Socket [%s, %s] created' % (self.mode, self.type_))
+        self.log('Socket [%s, %s] created: %s' %
+                 (self.mode.decode(), self.type_.decode(), self.address))
 
     async def send(self, message, wait=False):
         self.log('Sending')
         if wait:
             raise NotImplementedError
-        self._socket.write((message,))
+        await self._socket.write((message,))
 
     @asyncio.coroutine
     def receive(self, wait=True):
-        self.log('Receiving')
+        # self.log('Receiving')
         yield (yield from self._input.recv(0 if wait else zmq.NOBLOCK))
 
     @asyncio.coroutine
     def receiver(self):
         while self.active:
-            self.log('Receiving+')
+            # self.log('Receiving+')
             yield (yield from self._input.recv())
 
 
-class PyZMQPipe(Pipe):
-    PUB_SUB = '.PUB_SUB'
-    PUSH_PULL = '.PUSH_PULL'
+class SyncZMQPipe(Pipe):
+    PUB_SUB = b'PUB_SUB'
+    PUSH_PULL = b'PUSH_PULL'
+    SENDER = b'SENDER'
+    RECEIVER = b'RECEIVER'
 
-    def __init__(self, name, zcontext=zcontext, mode=PUSH_PULL, **kwargs):
+    def __init__(self, name, type_=None, mode=PUSH_PULL, **kwargs):
         super().__init__(name, **kwargs)
-        self.zcontext = zcontext
-        if mode == self.PUSH_PULL:
-            self._isocket_type = zmq.PULL
-            self._osocket_type = zmq.PUSH
-        elif mode == self.PUB_SUB:
-            self._isocket_type = zmq.SUB
-            self._osocket_type = zmq.PUB
-        else:
-            raise ValueError('Unknown mode %r' % mode)
+        self.type_ = type_
+        self.mode = mode
+
+    _modes = {
+        PUSH_PULL: {
+            RECEIVER: dict(mode=zmq.PULL, method='connect'),
+            SENDER: dict(mode=zmq.PUSH, method='bind')},
+        PUB_SUB: {
+            RECEIVER: dict(mode=zmq.SUB, method='connect'),
+            SENDER: dict(mode=zmq.PUB, method='bind')}}
+
+    @property
+    def _create_socket(self, type_, mode):
+        if not hasattr(self, '_isocket'):
+            self._isocket = self.zcontext.socket(self._isocket_type)
+            self._isocket.connect(self.address)
+        return self._isocket
 
     @property
     def _input(self):
@@ -221,44 +342,8 @@ class PyZMQPipe(Pipe):
             yield (yield from self._input.recv())
 
 
-class DevNull(Pipe):
-    def send(self, message, **kwargs):
-        pass
-
-
-PIPETYPES = dict(janus=JanusPipe, queue=ThreadPipe, zmq=ZMQPipe, null=DevNull)
-
-
-class AsyncQueueIterator(LogUtil):
-    def __init__(self, queue):
-        self.queue = queue
-        self.log('Initialized')
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        self.log('Waiting')
-        message = await self.queue.get()
-        self.log('Got %r' % (message,))
-        self.queue.task_done()
-        if message == EOT:
-            self.count -= 1
-            if self.count == 0:
-                await self.queue.join()
-                raise StopAsyncIteration
-        self.log('Returning %r' % (message,))
-        return message
-        if not self.manifold.active:
-            raise StopAsyncIteration
-
-
-class Collector(AsyncQueueIterator):
-    def __init__(self, manifold):
-        self.manifold = manifold
-        self.count = len(manifold.channels)
-        self.name = '%s-collector' % manifold.name
-        super().__init__(manifold.collector)
+PIPETYPES = dict(file=FilePipe, janus=JanusPipe, null=DevNull, pulse=PulsePipe,
+                 queue=ThreadPipe, zmq=ZMQPipe)
 
 
 class Manifold(Pipe):
@@ -276,27 +361,51 @@ class Manifold(Pipe):
 class Inbox(Manifold):
     def run(self):
         self.collector = asyncio.Queue(maxsize=self.buffersize)
-        runnables = [pipe.start() for pipe in self.channels.values()]
-        for name in self.channels:
-            runnables.append(
-                self.feed(name, self.channels[name], self.collector))
-            self.log('Created feed %s' % name)
-        print(repr(runnables))
-        return asyncio.gather(*runnables)
+        coroutines = [pipe.start(self.loop) for pipe in self.channels.values()]
+        if len(self.channels) > 1:
+            for name in self.channels:
+                coroutines.append(
+                    self.feed(name, self.channels[name]))
+                self.log('Created feed %s' % name)
+            self._active_feeds = set(self.channels)
+        return asyncio.gather(*coroutines)
 
-    async def feed(self, name, pipe, collector):
-        message = None
-        while self.active and message != EOT:
-            self.log('Waiting for pipe %s' % name)
-            self.log('pipe.receive: %r' % pipe.receive)
+    async def feed(self, name, pipe):
+        while self.active:
+            # self.log('Waiting for pipe %s' % name)
+            # self.log('pipe.receive: %r' % pipe.receive)
             message = await pipe.receive()
-            self.log('Pipe %s gave %r' % (name, message))
-            await collector.put((name, message))
-            self.log('Sent %r to collector' % message)
-        self.log('Exiting')
+            # self.log('Pipe %s gave %r' % (name, message))
+            if message == EOT:
+                self.log('Exhausted feed: %s' % name)
+                self._active_feeds.remove(name)
+                if len(self._active_feeds) == 0:
+                    await self.collector.put((None, EOT))
+                return
 
-    def receiver(self):
-        return Collector(self)
+            else:
+                await self.collector.put((name, message))
+                # self.log('Collected %r' % message)
+
+    @async_generator
+    async def receiver(self):
+        if len(self.channels) == 1:
+            channel, pipe = list(self.channels.items())[0]
+            async for message in pipe:
+                if message == EOT:
+                    self.stop()
+                else:
+                    await yield_((channel, message))
+                if not self.active:
+                    break
+
+        else:
+            while self.active:
+                channel, message = await self.collector.get()
+                if message is EOT:
+                    self.stop()
+                else:
+                    await yield_((channel, message))
 
 
 class Outbox(Manifold):
@@ -304,16 +413,15 @@ class Outbox(Manifold):
         return self.sender(messages)
 
     def run(self):
-        runnables = [pipe.start() for pipe in self.channels.values()]
-        print(repr(runnables))
-        return asyncio.gather(*runnables)
+        coroutines = [pipe.start(self.loop) for pipe in self.channels.values()]
+        return asyncio.gather(*coroutines)
 
     @async_generator
     async def sender(self, messages):
         self.log('Ready to send')
         async for channel, message in messages:
-            self.log('Sending to %s' % channel)
-            await self.channels[channel].send(message)
+            self.log('Sending to %s: %r' % (channel, message))
+            await self.channels[channel].send(message.encode())
             await yield_((channel, message))
 
 
@@ -346,21 +454,21 @@ class Node(Runnable, LogUtil):
             pipe = class_(default=pipe)
         return pipe
 
-    def start(self):
+    def start(self, *args):
+        coroutines = [super().start(*args)]
         self.layers = ([self.inbox] +
                        self.ifilters.ordered() +
                        [self.spawn(self.processor)] +
                        self.ofilters.ordered() +
                        [self.outbox])
-        runnables = [super().start()]
         for layer in self.layers:
             if isinstance(layer, Runnable):
-                runnables.append(layer.start())
-        return asyncio.gather(*runnables)
+                coroutines.append(layer.start(self.loop))
+        return asyncio.gather(*coroutines)
 
     async def run(self):
         self.log('Spinning')
-        while self.active:
+        while self.active and self.inbox.active:
             chain = self.layers[0]
             for layer in self.layers[1:]:
                 chain = layer(chain)
@@ -389,14 +497,19 @@ class Filter(Runnable, LogUtil):
 
     @async_generator
     async def filter(self, messages):
-        for message in messages:
-            raise NotImplementedError
-            await yield_(message)
+        async for channel, message in messages:
+            channel, message = await self.process(channel, message)
+            await yield_((channel, message))
+            if not self.active:
+                break
+
+    async def process(self, channel, message):
+        raise NotImplementedError
 
 
 class Batcher(Filter):
-    _RELEASE = '.release'
-    _DEFAULT = '.default'
+    _RELEASE = b'.release'
+    _DEFAULT = b'.default'
 
     def __init__(self, settings, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -412,11 +525,11 @@ class Batcher(Filter):
     def start(self):
         self.initialize()
         self.feed = asyncio.Queue(maxsize=1)
-        runnables = [super().start(), self.batcher()]
+        coroutines = [super().start(self.loop), self.batcher()]
         for key, batch in self.batches.items():
             batch['alarm'] = asyncio.Queue(maxsize=1)
-            runnables.append(self.timer(key))
-        return asyncio.gather(*runnables)
+            coroutines.append(self.timer(key))
+        return asyncio.gather(*coroutines)
 
     @async_generator
     async def filter(self, messages):
