@@ -17,7 +17,25 @@ from zmq.asyncio import Context
 
 zcontext = Context.instance()
 
-EOT = (None, b'EOT')
+
+class EOT(object):
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return 'EOT'
+
+    def __bytes__(self):
+        return b'EOT'
+
+    def __eq__(self, other):
+        if isinstance(other, bytes):
+            return self.__bytes__() == other
+        elif isinstance(other, str):
+            return self.__str__() == other
+
+
+EOT = EOT()
 
 
 class LogUtil:
@@ -95,21 +113,11 @@ class QueuePipe(Pipe, QueueIterator):
         Pipe.__init__(self, name, *args, **kwargs)
         QueueIterator.__init__(self, queue or asyncio.Queue(maxsize=maxsize))
 
-    async def receive(self, wait=True):
-        self.log('Receiving')
-        if not wait:
-            raise NotImplementedError
-        try:
-            return await self.__anext__()
-
-        except StopAsyncIteration:
-            return EOT
-
     @async_generator
     async def receiver(self):
+        self.log('Receiving')
         while self.active:
-            self.log('Receiving+')
-            await yield_(await self.receive())
+            await yield_(await self.__anext__())
 
 
 class FilePipe(QueuePipe):
@@ -161,27 +169,18 @@ class TCPPipe(Pipe):
         writer = await self._get('writer')
         writer.write(message)
 
-    async def receive(self, wait=True):
-        # self.log('Receiving')
-        reader = await self._get('reader')
-        if not wait:
-            raise NotImplementedError
-
-        line = await reader.readline()
-        if not line:  # EOF
-            reader.feed_eof()
-            self.stop()
-            line = EOT
-        else:
-            line = line.decode()
-        return line
-
     @async_generator
     async def receiver(self):
+        self.log('Receiving')
         reader = await self._get('reader')
         while self.active:
-            # self.log('Receiving+')
-            await yield_(await self.receive())
+            line = await reader.readline()
+            if not line:  # EOF
+                reader.feed_eof()
+                self.stop()
+                return
+
+            await yield_(line)
 
 
 class PulsePipe(QueuePipe):
@@ -205,8 +204,11 @@ class JanusPipe(Pipe):
         self._queue = janus.Queue(maxsize=1)
         self.receiver = QueueIterator(self._queue.async_q)
         if mode == self.INPUT_IS_ASYNC:
-            self.send, self.receive, self.receiver = (
-                self._async_send, self._sync_receive, self._sync_receiver)
+            self.send, self.receiver = self._async_send, self._sync_receiver
+
+    def send(self, message, wait=True):
+        self.log('Sending')
+        self._queue.sync_q.put(message, wait)
 
     async def _async_send(self, message, wait=True):
         self.log('Sending')
@@ -215,25 +217,16 @@ class JanusPipe(Pipe):
         else:
             await self._queue.async_q.put_nowait(message)
 
-    def send(self, message, wait=True):
-        self.log('Sending')
-        self._queue.sync_q.put(message, wait)
-
-    def _sync_receive(self, wait=True):
-        # self.log('Receiving')
-        return self._queue.sync_q.get(wait)
-
-    async def receive(self, wait=True):
-        # self.log('Receiving')
-        if wait:
-            return await self._queue.async_q.get()
-        else:
-            return await self._queue.async_q.get_nowait()
+    @async_generator
+    async def receiver(self):
+        self.log('Receiving')
+        while self.active:
+            await yield_(await self._queue.async_q.get())
 
     def _sync_receiver(self):
+        self.log('Receiving')
         while self.active:
-            # self.log('Receiving+')
-            yield self._input.get()
+            yield self._queue.sync_q.get()
 
 
 class ZMQPipe(Pipe):
@@ -255,18 +248,20 @@ class ZMQPipe(Pipe):
             RECEIVER: dict(mode=zmq.SUB, method='connect'),
             SENDER: dict(mode=zmq.PUB, method='bind')}}
 
-    @asyncio.coroutine
-    def _create_socket(self, type_, mode):
-        return (yield from aiozmq.create_zmq_stream(
-            type_, **{mode: self.address}))
-
     async def run(self):
         self.log('Running')
-        self._socket = await self._create_socket(
+        kwargs = dict(loop=self.loop)
+        kwargs[self._modes[self.mode][self.type_]['method']] = self.address
+        self._stream = await aiozmq.create_zmq_stream(
             self._modes[self.mode][self.type_]['mode'],
-            self._modes[self.mode][self.type_]['method'])
+            **kwargs)
         self.log('Socket [%s, %s] created: %s' %
                  (self.mode.decode(), self.type_.decode(), self.address))
+
+    async def _get_stream(self):
+        while not hasattr(self, '_stream'):
+            await asyncio.sleep(0.01)
+        return self._stream
 
     async def send(self, message, wait=False):
         self.log('Sending')
@@ -274,72 +269,15 @@ class ZMQPipe(Pipe):
             raise NotImplementedError
         await self._socket.write((message,))
 
-    @asyncio.coroutine
-    def receive(self, wait=True):
-        # self.log('Receiving')
-        yield (yield from self._input.recv(0 if wait else zmq.NOBLOCK))
-
-    @asyncio.coroutine
-    def receiver(self):
-        while self.active:
-            # self.log('Receiving+')
-            yield (yield from self._input.recv())
-
-
-class SyncZMQPipe(Pipe):
-    PUB_SUB = b'PUB_SUB'
-    PUSH_PULL = b'PUSH_PULL'
-    SENDER = b'SENDER'
-    RECEIVER = b'RECEIVER'
-
-    def __init__(self, name, type_=None, mode=PUSH_PULL, **kwargs):
-        super().__init__(name, **kwargs)
-        self.type_ = type_
-        self.mode = mode
-
-    _modes = {
-        PUSH_PULL: {
-            RECEIVER: dict(mode=zmq.PULL, method='connect'),
-            SENDER: dict(mode=zmq.PUSH, method='bind')},
-        PUB_SUB: {
-            RECEIVER: dict(mode=zmq.SUB, method='connect'),
-            SENDER: dict(mode=zmq.PUB, method='bind')}}
-
-    @property
-    def _create_socket(self, type_, mode):
-        if not hasattr(self, '_isocket'):
-            self._isocket = self.zcontext.socket(self._isocket_type)
-            self._isocket.connect(self.address)
-        return self._isocket
-
-    @property
-    def _input(self):
-        if not hasattr(self, '_isocket'):
-            self._isocket = self.zcontext.socket(self._isocket_type)
-            self._isocket.connect(self.address)
-        return self._isocket
-
-    @property
-    def _output(self):
-        if not hasattr(self, '_osocket'):
-            self._osocket = self.zcontext.socket(self._osocket_type)
-            self._osocket.bind(self.address)
-        return self._osocket
-
-    async def send(self, message, wait=True):
-        self.log('Sending')
-        await self._output.send(message, 0 if wait else zmq.NOBLOCK)
-
-    @asyncio.coroutine
-    def receive(self, wait=True):
+    @async_generator
+    async def receiver(self):
         self.log('Receiving')
-        yield (yield from self._input.recv(0 if wait else zmq.NOBLOCK))
-
-    @asyncio.coroutine
-    def receiver(self):
+        stream = await self._get_stream()
         while self.active:
-            self.log('Receiving+')
-            yield (yield from self._input.recv())
+            message = (await stream.read())[0]
+            if message == EOT:
+                self.stop()
+            await yield_(message)
 
 
 PIPETYPES = dict(file=FilePipe, janus=JanusPipe, null=DevNull, pulse=PulsePipe,
@@ -402,7 +340,7 @@ class Inbox(Manifold):
         else:
             while self.active:
                 channel, message = await self.collector.get()
-                if message is EOT:
+                if message == EOT:
                     self.stop()
                 else:
                     await yield_((channel, message))
@@ -570,7 +508,6 @@ class Batcher(Filter):
         await self.feed.join()
 
     async def timer(self, key):
-        from datetime import datetime
         batch = self.batches[key]
         while self.active:
             self.log('Timer %s ready' % key)
