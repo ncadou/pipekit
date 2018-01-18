@@ -265,9 +265,10 @@ class ZMQPipe(Pipe):
 
     async def send(self, message, wait=False):
         self.log('Sending')
+        stream = await self._get_stream()
         if wait:
             raise NotImplementedError
-        await self._socket.write((message,))
+        stream.write((message,))
 
     @async_generator
     async def receiver(self):
