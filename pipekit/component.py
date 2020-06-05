@@ -33,7 +33,8 @@ class Component:
         self._paused = False
 
         self.settings = Box(self.configure(*args, **kwargs) or dict())
-        config_text = ' '.join(f'{k}={v}' for k, v in self.settings.items())
+        config_text = (' '.join(f'{k}={v}'
+                                for k, v in workflow.safe_settings(self.settings).items()))
         self.debug(f'Initialized {config_text}')
 
     def configure(self):

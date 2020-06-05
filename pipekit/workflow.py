@@ -246,7 +246,23 @@ class Workflow:
     def make_component(self, class_, *args, **kwargs):
         return class_(self, *args, **kwargs)
 
+    _SECRETS = set('account password secret'.split())
+
+    def safe_settings(self, settings=__MISSING__):
+        """Return modified settings where secrets have been hidden."""
+        if settings is self.__MISSING__:
+            settings = self.app.to_dict()
+        for key, value in settings.items():
+            if isdict(value):
+                settings[key] = self.safe_settings(value)
+            elif islist(value):
+                settings[key] = [self.safe_settings(i) for i in value]
+            elif key in self._SECRETS:
+                settings[key] = '<secret>'
+        return settings
+
     def run(self):
+        """Create engine and run workflow."""
         self.engine = ETLEngine(self)
         self.engine.run()
 
