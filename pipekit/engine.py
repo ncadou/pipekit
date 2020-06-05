@@ -7,7 +7,7 @@ _l = logging.getLogger(__name__)
 
 
 class ETLEngine:
-    """Executor for `Workflow` instances."""
+    """Executor for Workflow instances."""
 
     def __init__(self, workflow):
         self.workflow = workflow

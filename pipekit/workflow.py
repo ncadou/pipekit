@@ -58,7 +58,11 @@ class Workflow:
             useref = element.pop('<use>', None)
             if useref:
                 seen.add(useref)
-                useref = type(element)(settings[useref].to_dict())
+                try:
+                    useref = type(element)(settings[useref].to_dict())
+                except KeyError:
+                    raise ConfigurationException(f'Reference "{useref}" not found')
+
                 useref.merge_update(element)
                 element = useref
             return type(element)((k, self.expand(settings, e, seen=seen))

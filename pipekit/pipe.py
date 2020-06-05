@@ -3,9 +3,9 @@
 import asyncio
 import logging
 from datetime import datetime
+from uuid import uuid4
 
 from box import Box
-from uuid import uuid4
 
 from .component import Component
 from .utils import aiter

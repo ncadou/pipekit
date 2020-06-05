@@ -2,7 +2,6 @@
 import codecs
 from setuptools import setup, find_packages
 
-
 with codecs.open('README.rst', encoding='utf-8') as f:
     long_description = f.read()
 
@@ -14,7 +13,7 @@ install_requires = [
 
 setup(
     name='pipekit',
-    version='0.1.0',
+    version='0.1.2',
     description='Tools for flow-based programming',
     long_description=long_description,
     url='https://github.com/ncadou/pipekit',
@@ -30,7 +29,7 @@ setup(
         'Programming Language :: Python :: 3.7',
         'Topic :: Software Development :: Libraries :: Python Modules',
     ],
-    keywords='pipe pipeline queue topology flow based programming',
+    keywords='etl workflow flow-based pipe pipeline queue data processing',
     packages=find_packages(exclude=['contrib', 'docs', 'tests*']),
     install_requires=install_requires,
     entry_points={

@@ -2,9 +2,11 @@
 
 import asyncio
 import logging
+from collections import deque
 from threading import Barrier, Thread
 
 import janus
+from box import Box
 
 from .component import Component
 from .pipe import Manifold, Message
@@ -40,7 +42,7 @@ class Node(Component):
             pipes = dict(default=pipes)
         msgbox = self.workflow.make_component(class_, id=self.id, **pipes)
         for channel, pipe in pipes.items():
-            pipe.parent = self
+            pipe.parent = self  # FIXME: other node overwrites .parent
         return msgbox
 
     def start(self, *args):
@@ -62,6 +64,7 @@ class Node(Component):
                 self.info(f'Waiting on layer {layer} to be ready')
                 await layer.ready.wait()
                 self.info(f'Layer {layer} is ready')
+        # TODO: handle exceptions, and possibly restart
         if self.running and self.inbox.running:
             stack = self.layers[0]
             for layer in self.layers[1:]:
@@ -91,7 +94,7 @@ class Node(Component):
 
     process.stub = True
 
-    def drop(self, message):
+    def drop(self, message):  # TODO: implement message accounting and leak detection
         raise NotImplementedError(f'drop() in {self}')
 
 
