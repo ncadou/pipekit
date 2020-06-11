@@ -49,7 +49,7 @@ class Node(Component):
         coroutines = [super().start(*args)]
         self.layers = ([self.inbox] +
                        self.ifilters.ordered() +
-                       [self.spawn(self.processor)] +
+                       [self.spawn_processor()] +
                        self.ofilters.ordered() +
                        [self.outbox])
         for layer in self.layers:
@@ -79,12 +79,31 @@ class Node(Component):
 
             self.debug(f'Finished processing')
 
-    def spawn(self, processor):
-        if self.blocking or self.scale > 1:
-            processor = ThreadedProcessor(processor, scale=self.scale)
-        return processor
+    def spawn_processor(self):
+        processor = self.get_processor()
+        if self.blocking:
+            raise NotImplementedError(f'Node.blocking in {self}')
 
-    async def processor(self, messages):
+        if self.scale == 1:
+            return processor
+
+        elif self.scale > 1:
+            return MultiProcessor(self)
+
+    def get_processor(self):
+        if isinstance(self, WithRetry):
+            self._retryable = None
+            return self._retryable_processor
+
+        return self.processor
+
+    async def _retryable_processor(self, messages, id_=None):
+        if self._retryable is None:
+            self._retryable = RetryableMessages(self, messages)
+        async for channel, message in self.processor(self._retryable, id_):
+            yield channel, message
+
+    async def processor(self, messages, id_=None):
         """Process and yield new (channel, message)."""
         async for channel, message in messages:
             yield await self.process(channel, message)
@@ -96,6 +115,61 @@ class Node(Component):
 
     def drop(self, message):  # TODO: implement message accounting and leak detection
         raise NotImplementedError(f'drop() in {self}')
+
+
+class WithRetry:
+    pass
+
+
+class MultiProcessor:
+
+    def __init__(self, node):
+        self.node = node
+        self.processor = self.node.get_processor()
+
+    async def feeder(self, messages):
+        """Loop through all messages from the inbox and relay them to the input queue."""
+        async for channel, message in messages:
+            self.pending += 1
+            await self.iqueue.put((channel, message))
+        self.exhausted = True
+        if self.pending > 0:
+            await self.finished.wait()
+        for i in range(self.node.scale):
+            await self.iqueue.put(Message.EOT)
+
+    async def collector(self, id_):
+        """Launch an instance of the node processor, and relay its output to the output queue."""
+        async for channel, message in self.processor(aiter(self.iqueue.get, Message.EOT), id_=id_):
+            await self.oqueue.put((channel, message))
+        await self.oqueue.put((None, Message.EOT))
+
+    async def outfeed(self, messages):
+        """Launch all processor instances and return an iterator that feeds on the output queue."""
+        self.iqueue = asyncio.Queue(maxsize=self.node.scale)  # input queue
+        self.oqueue = asyncio.Queue(maxsize=1)                # output queue
+        self.finished = asyncio.Event()
+        self.exhausted = False
+        self.pending = 0  # number of messages currently handled by node processor
+        coroutines = [self.node.loop.create_task(self.feeder(messages))]
+        for i in range(self.node.scale):
+            coroutines.append(self.node.loop.create_task(self.collector(i)))
+        running = self.node.scale
+        while running or not self.oqueue.empty():
+            channel, message = await self.oqueue.get()
+            self.oqueue.task_done()
+            if message is Message.EOT:
+                running -= 1
+            else:
+                self.pending -= 1
+                if self.pending == 0 and self.exhausted:
+                    self.finished.set()
+                yield channel, message
+
+        for coroutine in coroutines:
+            await coroutine
+
+    __call__ = outfeed
 
 
 class Inbox(Manifold):
@@ -149,13 +223,61 @@ class Inbox(Manifold):
             events.received.set()
         self.debug(f'Receiver for {channel} is exiting')
 
-    async def _retry(self, channel, message, wait=0):
-        await asyncio.sleep(wait)
-        await self.channels[channel].send(message)
 
-    def retry(self, channel, message, wait=0):
-        self.debug(f'Retrying in {wait}s on {channel}: {message}')
-        asyncio.run_coroutine_threadsafe(self._retry(channel, message, wait), loop=self.loop)
+class RetryableMessages:
+    """Interfaces a queue between the inbox and the processor where we can insert back retries."""
+
+    def __init__(self, node, messages):
+        self.node = node
+        self.messages = messages
+        self._forwarder = None
+
+    async def __aiter__(self):
+        if self._forwarder is None:  # singleton forwarder, for when we're using MultiProcessor
+            self._forwarder = self.forwarder()
+        return self._forwarder
+
+    async def feeder(self):
+        """Feed the inbox to the queue."""
+        async for channel, self.newmsg in self.messages:
+            self.forwarded.clear()
+            await self.queue.put((channel, self.newmsg))
+            await self.forwarded.wait()
+        self.exhausted = True
+        if self.pending > 0:
+            await self.finished.wait()
+        await self.queue.put(Message.EOT)
+
+    async def forwarder(self):
+        """Turn the queue into an iterator that the processor can consume."""
+        self.queue = asyncio.Queue()
+        self.forwarded = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.exhausted = False
+        self.newmsg = None
+        self.pending = 0  # number of messages currently handled by node processor
+        feeder = self.node.loop.create_task(self.feeder())
+        async for channel, message in aiter(self.queue.get, Message.EOT):
+            self.queue.task_done()
+            if message is self.newmsg:
+                self.forwarded.set()
+            self.pending += 1
+            yield channel, message
+
+        self.queue.task_done()
+        await feeder
+
+    def processing_done(self):
+        """Signal that a message is not in the processor anymore."""
+        self.pending -= 1
+        if self.exhausted:
+            self.finished.set()
+
+    async def retry(self, channel, message, wait=0.001, id_=None):
+        """Insert a message back into the queue for retrying it."""
+        await asyncio.sleep(wait)
+        await self.node.loop.create_task(self.queue.put((channel, message)))
+        self.processing_done()
 
 
 class Outbox(Manifold):
@@ -172,11 +294,9 @@ class Outbox(Manifold):
                 self.debug(f'Sending to {channel}: {message}')
                 if channel in self.channels:
                     await self.channels[channel].send(message)
-                    self.debug(f'Sent to    {channel}: {message} [{self.channels[channel].id}]')
                     message.checkout(self)
                     yield channel, message
 
-                    self.debug(f'Yielded    {channel}: {message}')
                 else:
                     raise KeyError(f'Channel "{channel}" does not exist in {self}')
 

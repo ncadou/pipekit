@@ -118,7 +118,7 @@ class Workflow:
         if isstr(defined_channels) and defined_channels.startswith('<'):
             return  # reference will be later resolved in _configure_connections()
 
-        # Expand shortened configuration structure, if relevent.
+        # Expand shortened configuration structure, if relevant.
         channels = Box(defaults)
         if ischannel(defined_channels):
             channels.update(default=defined_channels)
@@ -153,7 +153,6 @@ class Workflow:
         # Import all channels from peer node, if configured in.
         defined_channels = node.get(msgbox, {})
         if isstr(defined_channels) and defined_channels.startswith('<'):
-                # not defined_channels.endswith('>'):
             spec = defined_channels.strip('< ')
             peer_node, _ = self.peer_node(spec, node)
             peer_msgbox = 'outbox' if msgbox == 'inbox' else 'inbox'
@@ -251,7 +250,8 @@ class Workflow:
     def safe_settings(self, settings=__MISSING__):
         """Return modified settings where secrets have been hidden."""
         if settings is self.__MISSING__:
-            settings = self.app.to_dict()
+            settings = self.app
+        settings = settings.copy()
         for key, value in settings.items():
             if isdict(value):
                 settings[key] = self.safe_settings(value)
