@@ -10,7 +10,7 @@ from box import Box
 
 from .component import Component
 from .pipe import Manifold, Message
-from .utils import aiter
+from .utils import aiter, isdict, islist
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,22 @@ class Node(Component):
 
     def drop(self, message):  # TODO: implement message accounting and leak detection
         raise NotImplementedError(f'drop() in {self}')
+
+    def merged_settings(self, message, key=None, msgmap=None):
+        """Return node settings, with values overridden from the message if present."""
+        settings = self.settings.to_dict()
+        message = message.to_dict()
+        if key:
+            settings = settings[key]
+            message = message[key]
+        if msgmap is None:
+            msgmap = list(settings)
+        if islist(msgmap):
+            msgmap = dict(zip(msgmap, msgmap))
+        elif not isdict(msgmap):
+            raise TypeError(f'Argument msgmap must be a mapping or a sequence, not {type(msgmap)}')
+
+        return Box(settings, **dict((arg, message[msgarg]) for arg, msgarg in msgmap.items()))
 
 
 class WithRetry:
