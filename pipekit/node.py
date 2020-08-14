@@ -326,6 +326,7 @@ class Outbox(Manifold):
 
 
 class Filter(Component):
+
     def __call__(self, messages):
         return self.filter(messages)
 
@@ -350,6 +351,34 @@ class ChannelChain(Filter):
         for test_name, test_fn in self.TESTS.items():
             if test_fn(message):
                 return test_name, message
+
+
+class MessageMangleFilter(Filter):
+
+    def deepget(self, mapping, key):
+        if '.' not in key:
+            return mapping[key]
+
+        else:
+            current, remainder = key.split('.', 1)
+            return self.deepget(mapping[current], remainder)
+
+    def deepset(self, mapping, key, value):
+        if '.' not in key:
+            mapping[key] = value
+
+        else:
+            current, remainder = key.split('.', 1)
+            self.deepset(mapping[current], remainder, value)
+
+    async def process(self, channel, message):
+        for spec in self.settings.attributes:
+            if len(spec) != 1:
+                raise ValueError(f'Bad configuration: {self.settings}')
+
+            key = list(spec.keys())[0]
+            self.deepset(message, key, spec[key].format(**message))
+        return channel, message
 
 
 class ThreadedNode(Node):
@@ -382,27 +411,59 @@ class ThreadedProcessor:
             if i:  # skip the one already consumed by aiter above
                 await self.oqueue.async_q.get()
             self.oqueue.async_q.task_done()
+            # print(f'thread {i} EOT received back')
 
-        while self.threads:
-            asyncio.sleep(0.1)
+        while self.threads:  # FIXME: join threads instead, and move or retire del self.threads[]
+            asyncio.sleep(0.1)  #     while at it, catch exceptions and clean up queue with task_done  # noqa: E501
+        # print(f'all threads stopped')
 
     async def thread_feeder(self, messages):
         async for (channel, message) in messages:
+            # TODO: recreate dead threads, report thread failures
             await self.iqueue.async_q.put((channel, message))
         for i in range(self.scale):
             await self.iqueue.async_q.put((None, Message.EOT))
+            # print(f'thread {i} EOT sent')
 
     def thread_consumer(self, threadnum):  # runs in thread
+        # print(f'thread {threadnum} started')
         queue_iter = iter(self.iqueue.sync_q.get, (None, Message.EOT))
         for channel, message in self.processor(queue_iter):
             self.iqueue.sync_q.task_done()
             self.oqueue.sync_q.put((channel, message))
+        # print(f'thread {threadnum} EOT received')
         self.iqueue.sync_q.task_done()  # for EOT which does not make it past queue iterator
+        # print(f'thread {threadnum} task done')
         self.barrier.wait()
-        self.oqueue.sync_q.put((None, Message.EOT))
+        self.oqueue.sync_q.put((None, Message.EOT))  # TODO: use threading.Event to send just one
+        # print(f'thread {threadnum} EOT sent back')
         del self.threads[threadnum]
+        # print(f'thread {threadnum} stopped')
 
 
 class PriorityRegistry(dict):
     def ordered(self):
         return [item for _, item in sorted(self.items())]
+
+
+class CmdRunner:
+
+    async def runcmd(self, *args, raise_=True, **kwargs):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *map(str, args), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                **kwargs)
+            await proc.wait()
+            exitcode = await proc.wait()
+            stdout = (await proc.stdout.read()).decode()
+            stderr = (await proc.stderr.read()).decode()
+            if exitcode:
+                raise RuntimeError(f'Command {args} ({kwargs}) returned with exitcode {exitcode}, '
+                                f'stdout: {stdout or None}, stderr: {stderr or None}')
+
+        except Exception as e:
+            self.logger.exception(f'Error running command: {e}')
+            if raise_:
+                raise
+
+        return exitcode, stdout, stderr
