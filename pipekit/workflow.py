@@ -256,14 +256,15 @@ class Workflow:
         """Return modified settings where secrets have been hidden."""
         if settings is self.__MISSING__:
             settings = self.app
-        settings = settings.copy()
-        for key, value in settings.items():
-            if isdict(value):
-                settings[key] = self.safe_settings(value)
-            elif islist(value):
-                settings[key] = [self.safe_settings(i) for i in value]
-            elif key in self._SECRETS:
-                settings[key] = '<secret>'
+        if isdict(settings):
+            settings = settings.copy()
+            for key, value in settings.items():
+                if isdict(value):
+                    settings[key] = self.safe_settings(value)
+                elif islist(value):
+                    settings[key] = [self.safe_settings(i) for i in value]
+                elif key in self._SECRETS:
+                    settings[key] = '<secret>'
         return settings
 
     def run(self):
