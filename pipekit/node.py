@@ -61,9 +61,9 @@ class Node(Component):
         await super().run()
         for layer in self.layers:
             if isinstance(layer, Component) and hasattr(layer, 'ready'):
-                self.info(f'Waiting on layer {layer} to be ready')
+                self.debug(f'Waiting on layer {layer} to be ready')
                 await layer.ready.wait()
-                self.info(f'Layer {layer} is ready')
+                self.debug(f'Layer {layer} is ready')
         # TODO: handle exceptions, and possibly restart
         if self.running and self.inbox.running:
             stack = self.layers[0]
