@@ -278,7 +278,7 @@ def resolve(spec):
     try:
         module, attr, *_ = spec.rsplit(':', 1) + [None]
         module = import_module(module)
-        return getattr(module, attr, None)
+        return getattr(module, attr)
 
     except Exception:
         raise ImportError(f'Failed to import component from spec: {spec}')
