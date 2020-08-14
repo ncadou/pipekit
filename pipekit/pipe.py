@@ -142,7 +142,8 @@ class Manifold(Pipe):
         await super().run()
         self.debug(f'- starting pipes')
         for pipe in self.channels.values():
-            await pipe.start()
+            if not pipe.running:
+                await pipe.start()
         self.ready.set()
 
 
