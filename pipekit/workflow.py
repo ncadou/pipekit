@@ -12,7 +12,7 @@ import strictyaml
 from box import Box
 
 from .engine import ETLEngine
-from .node import Node
+from .node import Node, PriorityRegistry
 from .pipe import PipeRef
 from .utils import isdict, islist, isstr
 
@@ -209,7 +209,12 @@ class Workflow:
                     pipe.component, id=f'{node.key}.input.{channel}', **pipe.get('settings', {}))
             inbox[channel] = pipe.instance
 
-        ifilters = None
+        ifilters = node.get('ifilters', {})
+        for name, filter_ in ifilters.items():
+            filter_.instance = self.make_component(
+                resolve(filter_.component), id=f'{node.key}.filter.{name}',
+                **filter_.get('settings', {}))
+        ifilters = PriorityRegistry(dict((k, f.instance) for k, f in ifilters.items()))
         ofilters = None
         node_args = dict(
             id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
