@@ -37,8 +37,9 @@ class Component:
                                 for k, v in workflow.safe_settings(self.settings).items()))
         self.debug(f'Initialized {config_text}')
 
-    def configure(self):
-        pass
+    def configure(self, **settings):
+        self.settings = settings
+        return settings
 
     @property
     def running(self):
