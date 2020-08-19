@@ -12,7 +12,7 @@ import strictyaml
 from box import Box
 
 from .engine import ETLEngine
-from .node import Node
+from .node import Node, PriorityRegistry
 from .pipe import PipeRef
 from .utils import isdict, islist, isstr
 
@@ -118,7 +118,7 @@ class Workflow:
         if isstr(defined_channels) and defined_channels.startswith('<'):
             return  # reference will be later resolved in _configure_connections()
 
-        # Expand shortened configuration structure, if relevent.
+        # Expand shortened configuration structure, if relevant.
         channels = Box(defaults)
         if ischannel(defined_channels):
             channels.update(default=defined_channels)
@@ -153,7 +153,6 @@ class Workflow:
         # Import all channels from peer node, if configured in.
         defined_channels = node.get(msgbox, {})
         if isstr(defined_channels) and defined_channels.startswith('<'):
-                # not defined_channels.endswith('>'):
             spec = defined_channels.strip('< ')
             peer_node, _ = self.peer_node(spec, node)
             peer_msgbox = 'outbox' if msgbox == 'inbox' else 'inbox'
@@ -210,7 +209,12 @@ class Workflow:
                     pipe.component, id=f'{node.key}.input.{channel}', **pipe.get('settings', {}))
             inbox[channel] = pipe.instance
 
-        ifilters = None
+        ifilters = node.get('ifilters', {})
+        for name, filter_ in ifilters.items():
+            filter_.instance = self.make_component(
+                resolve(filter_.component), id=f'{node.key}.filter.{name}',
+                **filter_.get('settings', {}))
+        ifilters = PriorityRegistry(dict((k, f.instance) for k, f in ifilters.items()))
         ofilters = None
         node_args = dict(
             id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
@@ -246,7 +250,25 @@ class Workflow:
     def make_component(self, class_, *args, **kwargs):
         return class_(self, *args, **kwargs)
 
+    _SECRETS = set('account password secret'.split())
+
+    def safe_settings(self, settings=__MISSING__):
+        """Return modified settings where secrets have been hidden."""
+        if settings is self.__MISSING__:
+            settings = self.app
+        if isdict(settings):
+            settings = settings.copy()
+            for key, value in settings.items():
+                if isdict(value):
+                    settings[key] = self.safe_settings(value)
+                elif islist(value):
+                    settings[key] = [self.safe_settings(i) for i in value]
+                elif key in self._SECRETS:
+                    settings[key] = '<secret>'
+        return settings
+
     def run(self):
+        """Create engine and run workflow."""
         self.engine = ETLEngine(self)
         self.engine.run()
 
@@ -256,7 +278,7 @@ def resolve(spec):
     try:
         module, attr, *_ = spec.rsplit(':', 1) + [None]
         module = import_module(module)
-        return getattr(module, attr, None)
+        return getattr(module, attr)
 
     except Exception:
         raise ImportError(f'Failed to import component from spec: {spec}')

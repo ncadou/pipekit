@@ -97,12 +97,7 @@ class Pipe(Component):
 
     def drop(self, message):
         if isinstance(message, Message):
-          try:
-            self.debug(f'--- dropping {message}')
             message.drop(self)
-          except:
-            __import__('pudb').set_trace()
-            raise
 
     async def receive(self, **kwargs):
         raise NotImplementedError(f'receive() out {self}')
@@ -147,7 +142,8 @@ class Manifold(Pipe):
         await super().run()
         self.debug(f'- starting pipes')
         for pipe in self.channels.values():
-            await pipe.start()
+            if not pipe.running:
+                await pipe.start()
         self.ready.set()
 
 
