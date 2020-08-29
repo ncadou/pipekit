@@ -13,7 +13,7 @@ from .utils import aiter
 _l = logging.getLogger(__name__)
 
 
-class Message(Box):
+class Message:
     """Data wrapper."""
 
     _instances = dict()  # TODO: check at end of workflow if any undropped messages are remaining
@@ -28,8 +28,21 @@ class Message(Box):
                    created=datetime.utcnow(),
                    history=list(),
                    dropped=False)
-        super().__init__(data, meta=meta)
-        self._instances[self.meta.id] = self
+        self._instances[meta.id] = self
+        self.__data = Box(data, meta=meta.to_dict(), box_dots=True)
+        setattr(self, f'__setattr__', getattr(self, f'__Xsetattr__'))  # prevent recursion
+
+    def __getattr__(self, name, **kwargs):
+        return getattr(self.__data, name, **kwargs)
+
+    def __Xsetattr__(self, name, value):
+        return setattr(self.__data, name, value)
+
+    def __getitem__(self, name, **kwargs):
+        return self.__data.get(name, **kwargs)
+
+    def __setitem__(self, name, value):
+        self.__data[name] = value
 
     def __str__(self):
         return f'<{self.__class__.__name__} {self.meta.id}>'
