@@ -25,6 +25,9 @@ class Message:
                    created=datetime.utcnow(),
                    history=list(),
                    dropped=False)
+        if meta.id in self._instances:
+            raise ValueError(f'Duplicate message ID: {meta.id!r}')
+
         self._instances[meta.id] = self
         self.__data = Box(data, meta=meta.to_dict(), box_dots=True)
         setattr(self, '__setattr__', getattr(self, '__Xsetattr__'))  # prevent recursion
