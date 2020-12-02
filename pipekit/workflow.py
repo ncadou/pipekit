@@ -208,13 +208,8 @@ class Workflow:
                     pipe.component, id=f'{node.key}.input.{channel}', **pipe.get('settings', {}))
             inbox[channel] = pipe.instance
 
-        ifilters = node.get('ifilters', {})
-        for name, filter_ in ifilters.items():
-            filter_.instance = self.make_component(
-                resolve(filter_.component), id=f'{node.key}.filter.{name}',
-                **filter_.get('settings', {}))
-        ifilters = PriorityRegistry(dict((k, f.instance) for k, f in ifilters.items()))
-        ofilters = None
+        ifilters = self._make_filters(node, 'ifilters')
+        ofilters = self._make_filters(node, 'ofilters')
         node_args = dict(
             id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
             ifilters=ifilters, ofilters=ofilters, outbox=outbox, **settings)
@@ -230,6 +225,15 @@ class Workflow:
 
         node.instance = self.make_component(node_class, **node_args)
         del self._node_backlog[node.key]
+
+    def _make_filters(self, node, type_):
+        """Instantiate and return filters wrapped in a PriorityRegistry."""
+        filters = node.get(type_, {})
+        for name, filter_ in filters.items():
+            filter_.instance = self.make_component(
+                resolve(filter_.component), id=f'{node.key}.{type_}.{name}',
+                **filter_.get('settings', {}))
+        return PriorityRegistry(dict((k, f.instance) for k, f in filters.items()))
 
     def peer_node(self, spec, dependent):
         """Return node instance and channel referenced in spec."""
