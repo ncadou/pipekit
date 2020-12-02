@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from .component import Component
+from .message import Message
 
 
 class Filter(Component):
@@ -12,9 +13,6 @@ class Filter(Component):
         async for channel, message in messages:
             channel, message = await self.process(channel, message)
             yield (channel, message)
-
-            if not self.running:
-                break
 
     async def process(self, channel, message):
         raise NotImplementedError(f'process() out {self}')
@@ -29,6 +27,25 @@ class ChannelChain(Filter):
         for test_name, test_fn in self.TESTS.items():
             if test_fn(message):
                 return test_name, message
+
+
+class LifeCycleSignal(Filter):
+
+    async def filter(self, messages):
+        async for channel, message in messages:
+            yield (channel, message)
+
+            if not self.running:
+                break
+
+        settings = self.settings()
+        if settings.event == 'finished':
+            yield (settings.get('channel', 'finished'), LifeCycleMessage('finished'))
+
+
+class LifeCycleMessage(Message):
+    def __init__(self, event, **kwargs):
+        super().__init__(event=event, **kwargs)
 
 
 class MessageMangleFilter(Filter):
