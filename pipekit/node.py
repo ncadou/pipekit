@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import asyncio
-import logging
 from collections import deque
 from threading import Barrier, Thread
 
@@ -11,8 +10,6 @@ from box import Box
 from .component import Component
 from .pipe import Manifold, Message
 from .utils import aiter, isdict, islist
-
-logger = logging.getLogger(__name__)
 
 
 class Node(Component):
@@ -74,10 +71,10 @@ class Node(Component):
                 async for result in stack:
                     result
             except Exception:
-                self.exception(f'Node failure')
+                self.exception('Node failure')
                 raise
 
-            self.debug(f'Finished processing')
+            self.debug('Finished processing')
 
     def spawn_processor(self):
         processor = self.get_processor()
@@ -307,7 +304,7 @@ class Outbox(Manifold):
             if channel is Message.DROP:
                 self.drop(message)
             else:
-                self.debug(f'Sending to {channel}: {message}')
+                self.debug(f'Sending message to {channel}: {message}')
                 if channel in self.channels:
                     await self.channels[channel].send(message)
                     message.checkout(self)
@@ -400,7 +397,7 @@ class CmdRunner:
             stderr = (await proc.stderr.read()).decode()
             if exitcode:
                 raise RuntimeError(f'Command {args} ({kwargs}) returned with exitcode {exitcode}, '
-                                f'stdout: {stdout or None}, stderr: {stderr or None}')
+                                   f'stdout: {stdout or None}, stderr: {stderr or None}')
 
         except Exception as e:
             self.logger.exception(f'Error running command: {e}')
