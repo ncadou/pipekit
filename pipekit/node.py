@@ -191,13 +191,30 @@ class Inbox(Manifold):
         raise NotImplementedError(f'receive() in {self}')
 
     async def receiver(self):
+        message = None
+        active_channels = 0
+        last_channel = False
         self.debug('Receiving')
         for channel, pipe in self._active_channels():
             if not self.running:
                 return
 
+            if pipe is None:
+                if active_channels == 1:
+                    last_channel = True
+                if message is False:  # all channels are empty
+                    await asyncio.sleep(0.05)
+
+                message = False
+                active_channels = 0
+                continue
+
+            active_channels += 1
             try:
-                message = await pipe.receive()
+                message = await pipe.receive(wait=last_channel)
+            except asyncio.QueueEmpty:
+                continue
+
             except Exception:
                 self.exception(f'Error while receiving on channel {channel}, {pipe}')
                 raise
@@ -215,6 +232,8 @@ class Inbox(Manifold):
     def _active_channels(self):
         active_channels = self.channels.copy()
         while active_channels:
+            yield None, None  # signal start of channels sweep
+
             for channel, pipe in active_channels.copy().items():
                 if not pipe.running:
                     self.debug(f'skipping stopped channel {channel}')

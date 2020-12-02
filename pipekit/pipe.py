@@ -82,7 +82,7 @@ class NullPipe(Pipe):
     async def send(self, message, **kwargs):
         self.drop(message)
 
-    async def receive(self):
+    async def receive(self, wait=True):
         return self.running and await asyncio.sleep(1 / self.settings.get('rate', 10 ** 0))
 
     async def receiver(self):
@@ -97,7 +97,7 @@ class DataPipe(Pipe):
         self.messages = [Message(**m) for m in reversed(messages or [])]
         return dict(messages=len(self.messages))
 
-    async def receive(self):
+    async def receive(self, wait=True):
         try:
             return self.messages.pop(-1)
 
@@ -120,11 +120,14 @@ class QueuePipe(Pipe):
     async def send(self, *args, **kwargs):
         return await self._queue.put(*args, **kwargs)
 
-    async def receive(self):
+    async def receive(self, wait=True):
         if not self.running:
             return Message.EOT
 
-        message = await self._queue.get()
+        if wait:
+            message = await self._queue.get()
+        else:
+            message = self._queue.get_nowait()
         self._queue.task_done()
         return message
 
