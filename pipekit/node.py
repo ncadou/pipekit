@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import asyncio
-import logging
 from collections import deque
 from threading import Barrier, Thread
 
@@ -11,8 +10,6 @@ from box import Box
 from .component import Component
 from .pipe import Manifold, Message
 from .utils import aiter, isdict, islist
-
-logger = logging.getLogger(__name__)
 
 
 class Node(Component):
@@ -74,10 +71,10 @@ class Node(Component):
                 async for result in stack:
                     result
             except Exception:
-                self.exception(f'Node failure')
+                self.exception('Node failure')
                 raise
 
-            self.debug(f'Finished processing')
+            self.debug('Finished processing')
 
     def spawn_processor(self):
         processor = self.get_processor()
@@ -194,13 +191,30 @@ class Inbox(Manifold):
         raise NotImplementedError(f'receive() in {self}')
 
     async def receiver(self):
+        message = None
+        active_channels = 0
+        last_channel = False
         self.debug('Receiving')
         for channel, pipe in self._active_channels():
             if not self.running:
                 return
 
+            if pipe is None:
+                if active_channels == 1:
+                    last_channel = True
+                if message is False:  # all channels are empty
+                    await asyncio.sleep(0.05)
+
+                message = False
+                active_channels = 0
+                continue
+
+            active_channels += 1
             try:
-                message = await pipe.receive()
+                message = await pipe.receive(wait=last_channel)
+            except asyncio.QueueEmpty:
+                continue
+
             except Exception:
                 self.exception(f'Error while receiving on channel {channel}, {pipe}')
                 raise
@@ -218,6 +232,8 @@ class Inbox(Manifold):
     def _active_channels(self):
         active_channels = self.channels.copy()
         while active_channels:
+            yield None, None  # signal start of channels sweep
+
             for channel, pipe in active_channels.copy().items():
                 if not pipe.running:
                     self.debug(f'skipping stopped channel {channel}')
@@ -307,7 +323,7 @@ class Outbox(Manifold):
             if channel is Message.DROP:
                 self.drop(message)
             else:
-                self.debug(f'Sending to {channel}: {message}')
+                self.debug(f'Sending message to {channel}: {message}')
                 if channel in self.channels:
                     await self.channels[channel].send(message)
                     message.checkout(self)
@@ -318,67 +334,8 @@ class Outbox(Manifold):
 
         self.debug('Finished sending')
         for pipe in self.channels.values():
-         try:
             self.debug(f'EOT to {pipe}')
             await pipe.send(Message.EOT)
-         except:
-            __import__('pudb').set_trace()
-
-
-class Filter(Component):
-
-    def __call__(self, messages):
-        return self.filter(messages)
-
-    async def filter(self, messages):
-        async for channel, message in messages:
-            channel, message = await self.process(channel, message)
-            yield (channel, message)
-
-            if not self.running:
-                break
-
-    async def process(self, channel, message):
-        raise NotImplementedError(f'process() out {self}')
-
-
-class ChannelChain(Filter):
-
-    TESTS = dict(directory=lambda m: m.path.id_dir(),
-                 file=lambda m: m.path.id_file())
-
-    async def process(self, channel, message):
-        for test_name, test_fn in self.TESTS.items():
-            if test_fn(message):
-                return test_name, message
-
-
-class MessageMangleFilter(Filter):
-
-    def deepget(self, mapping, key):
-        if '.' not in key:
-            return mapping[key]
-
-        else:
-            current, remainder = key.split('.', 1)
-            return self.deepget(mapping[current], remainder)
-
-    def deepset(self, mapping, key, value):
-        if '.' not in key:
-            mapping[key] = value
-
-        else:
-            current, remainder = key.split('.', 1)
-            self.deepset(mapping[current], remainder, value)
-
-    async def process(self, channel, message):
-        for spec in self.settings.attributes:
-            if len(spec) != 1:
-                raise ValueError(f'Bad configuration: {self.settings}')
-
-            key = list(spec.keys())[0]
-            self.deepset(message, key, spec[key].format(**message))
-        return channel, message
 
 
 class ThreadedNode(Node):
@@ -459,7 +416,7 @@ class CmdRunner:
             stderr = (await proc.stderr.read()).decode()
             if exitcode:
                 raise RuntimeError(f'Command {args} ({kwargs}) returned with exitcode {exitcode}, '
-                                f'stdout: {stdout or None}, stderr: {stderr or None}')
+                                   f'stdout: {stdout or None}, stderr: {stderr or None}')
 
         except Exception as e:
             self.logger.exception(f'Error running command: {e}')

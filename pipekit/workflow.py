@@ -38,7 +38,7 @@ class Workflow:
             except FileNotFoundError:
                 self.source = None
             except KeyError as e:
-                raise ConfigurationException(
+                raise ConfigurationError(
                     f'Missing environment variable "{e.args[0]}" (needed by {source})')
 
         self.definition = self.expand(Box(strictyaml.load(source).data, box_dots=True))
@@ -61,7 +61,7 @@ class Workflow:
                 try:
                     useref = type(element)(settings[useref].to_dict())
                 except KeyError:
-                    raise ConfigurationException(f'Reference "{useref}" not found')
+                    raise ConfigurationError(f'Reference "{useref}" not found')
 
                 useref.merge_update(element)
                 element = useref
@@ -87,6 +87,7 @@ class Workflow:
                 node.workflow = wname
                 node.key = f'{wname}.{nname}'
                 self._configure_node(node)
+                node.setdefault('outbox', dict(default=None))
                 for msgbox in ('inbox', 'outbox'):
                     self._configure_pipes(node, msgbox)
         for wname, workflow in self.app.workflows.items():
@@ -97,10 +98,10 @@ class Workflow:
     def _configure_node(self, node):
         try:
             node.component = resolve(node.component)
-        except:
+        except Exception:
             errmsg = f'Failed to import node "{node.get("component")}" (needed by {node.key})'
             _l.exception(errmsg)
-            raise ConfigurationException(errmsg)
+            raise ConfigurationError(errmsg)
 
     def _configure_pipes(self, node, msgbox):
         # Get default channels from class, if any.
@@ -109,23 +110,16 @@ class Workflow:
             if islist(defaults):
                 defaults = dict((c, None) for c in defaults)
             elif not isdict(defaults):
-                raise ConfigurationException(
-                    f'Default channels for {node.component} misconfigured')
+                raise ConfigurationError(f'Default channels for {node.component} misconfigured')
 
-        # Get channels from configured in definition.
-        defined_channels = node.get(msgbox, {})
-        ischannel = lambda v: isstr(v) or (isdict(v) and ('node' in v or 'component' in v))
-        if isstr(defined_channels) and defined_channels.startswith('<'):
-            return  # reference will be later resolved in _configure_connections()
-
-        # Expand shortened configuration structure, if relevant.
-        channels = Box(defaults)
-        if ischannel(defined_channels):
-            channels.update(default=defined_channels)
-        else:
-            channels.update(**defined_channels)
-        if not channels:
-            channels.update(default=None)
+        # Expand shortened configuration structure, if needed.
+        channels = node.get(msgbox, {})
+        if isstr(channels) or (
+                isdict(channels) and ('node' in channels or 'component' in channels)):
+            channels = dict(default=channels)
+        elif islist(channels):
+            channels = dict(zip(channels, [None] * len(channels)))
+        channels = Box(defaults, **channels)
 
         # Resolve pipe specs to classes.
         for name, spec in channels.items():
@@ -134,14 +128,15 @@ class Workflow:
                 spec = 'pipekit.pipe:QueuePipe'
             if isstr(spec):
                 if spec.startswith('<'):
-                    channel.node = spec.strip('< ')
+                    break  # reference will be later resolved in _configure_connections()
+
                 else:
                     channel.component = spec
             elif isdict(spec):
                 channel.update(spec)
             else:
-                raise ConfigurationException(
-                    f'Incorrect {msgbox} configuration for node {node.key}')
+                raise ConfigurationError(
+                    f'Incorrect {msgbox} configuration for node {node.key}: unknown spec {spec!r}')
 
             if 'component' in channel:
                 channel.component = resolve(channel.component)
@@ -150,16 +145,16 @@ class Workflow:
         node[msgbox] = channels
 
     def _configure_connections(self, node, msgbox):
-        # Import all channels from peer node, if configured in.
-        defined_channels = node.get(msgbox, {})
-        if isstr(defined_channels) and defined_channels.startswith('<'):
-            spec = defined_channels.strip('< ')
-            peer_node, _ = self.peer_node(spec, node)
-            peer_msgbox = 'outbox' if msgbox == 'inbox' else 'inbox'
-            channels = Box((c, PipeRef(peer_node, peer_msgbox, c))
-                           for c in getattr(peer_node, peer_msgbox))
+        for name, channel in node[msgbox].items():
+            if isstr(channel):
+                if not channel.startswith('<'):
+                    raise ConfigurationError('Unrecognized configuration item for '
+                                             f'{node.key}.{msgbox}:{name}: {channel}')
 
-            node[msgbox] = channels
+                spec = channel.strip('< ')
+                peer_node, peer_channel = self.peer_node(spec, node)
+                peer_msgbox = 'outbox' if msgbox == 'inbox' else 'inbox'
+                node[msgbox][name] = PipeRef(peer_node, peer_msgbox, peer_channel)
 
     def build(self):
         """Instantiate and wire up nodes and pipes."""
@@ -187,8 +182,8 @@ class Workflow:
         reserved_settings = self.RESERVED_SETTINGS.intersection(set(settings.keys()))
         if reserved_settings:
             plural = 's' if len(reserved_settings) > 1 else ''
-            raise ConfigurationException(f'Settings for node {node.key} contains reserved '
-                                         f'key{plural}: {", ".join(reserved_settings)}')
+            raise ConfigurationError(f'Settings for node {node.key} contains reserved '
+                                     f'key{plural}: {", ".join(reserved_settings)}')
 
         outbox = dict()
         for channel, pipe in node.outbox.items():
@@ -203,19 +198,18 @@ class Workflow:
                 raise Exception('node instance exists')
 
             if isinstance(pipe, PipeRef):
-                node.inbox[channel] = pipe = Box(component=pipe, instance=pipe.resolve())
+                try:
+                    node.inbox[channel] = pipe = Box(component=pipe, instance=pipe.resolve())
+                except KeyError:
+                    raise ConfigurationError(f'Pipe not found: {pipe}')
+
             else:
                 pipe.instance = self.make_component(
                     pipe.component, id=f'{node.key}.input.{channel}', **pipe.get('settings', {}))
             inbox[channel] = pipe.instance
 
-        ifilters = node.get('ifilters', {})
-        for name, filter_ in ifilters.items():
-            filter_.instance = self.make_component(
-                resolve(filter_.component), id=f'{node.key}.filter.{name}',
-                **filter_.get('settings', {}))
-        ifilters = PriorityRegistry(dict((k, f.instance) for k, f in ifilters.items()))
-        ofilters = None
+        ifilters = self._make_filters(node, 'ifilters')
+        ofilters = self._make_filters(node, 'ofilters')
         node_args = dict(
             id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
             ifilters=ifilters, ofilters=ofilters, outbox=outbox, **settings)
@@ -225,25 +219,35 @@ class Workflow:
             node_class = Node
             node_args['process'] = node.component
         else:
-            raise ConfigurationException(
+            raise ConfigurationError(
                 f'Node {node.key} should be a subclass of Node or a callable, '
                 f'got {type(node.component)} instead')
 
         node.instance = self.make_component(node_class, **node_args)
         del self._node_backlog[node.key]
 
+    def _make_filters(self, node, type_):
+        """Instantiate and return filters wrapped in a PriorityRegistry."""
+        filters = node.get(type_, {})
+        for name, filter_ in filters.items():
+            filter_.instance = self.make_component(
+                resolve(filter_.component), id=f'{node.key}.{type_}.{name}',
+                **filter_.get('settings', {}))
+        return PriorityRegistry(dict((k, f.instance) for k, f in filters.items()))
+
     def peer_node(self, spec, dependent):
+        """Return node instance and channel referenced in spec."""
         spec, channel, *_ = spec.rsplit(':', 1) + ['default']
         spec = spec.split('.')
         node = spec[-1]
-        node_key = '.'.join(spec[:-1] + [node,])
+        node_key = '.'.join(spec[:-1] + [node, ])
         try:
             node = self.app.workflows[node_key]
         except KeyError:
             try:
                 node = self.app.workflows[dependent.workflow][node_key]
             except KeyError:
-                raise ConfigurationException(
+                raise ConfigurationError(
                     f'Undefined node "{node_key}" (needed by {dependent.key})')
         return node, channel
 
@@ -284,5 +288,5 @@ def resolve(spec):
         raise ImportError(f'Failed to import component from spec: {spec}')
 
 
-class ConfigurationException(Exception):
+class ConfigurationError(Exception):
     pass

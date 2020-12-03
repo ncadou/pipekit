@@ -6,7 +6,7 @@ from functools import partial
 
 from box import Box
 
-logger = logging.getLogger(__name__)
+_l = logging.getLogger(__name__)
 
 
 class Component:
@@ -14,7 +14,7 @@ class Component:
 
     __instances = dict()
 
-    def __init__(self, workflow, *args, id=None, logger=logger, **kwargs):
+    def __init__(self, workflow, *args, id=None, logger=_l, **kwargs):
         self.workflow = workflow
         self.id = id
         if id:
@@ -32,14 +32,17 @@ class Component:
         self._running = False
         self._paused = False
 
-        self.settings = Box(self.configure(*args, **kwargs) or dict())
+        self._settings = Box(self.configure(*args, **kwargs) or dict())
         config_text = (' '.join(f'{k}={v}'
-                                for k, v in workflow.safe_settings(self.settings).items()))
+                                for k, v in workflow.safe_settings(self._settings).items()))
         self.debug(f'Initialized {config_text}')
 
     def configure(self, **settings):
-        self.settings = settings
+        self._settings = settings
         return settings
+
+    def settings(self, **settings):
+        return Box(self._settings, **settings)
 
     @property
     def running(self):
