@@ -264,7 +264,7 @@ class RetryableMessages:
         self.messages = messages
         self._forwarder = None
 
-    async def __aiter__(self):
+    def __aiter__(self):
         if self._forwarder is None:  # singleton forwarder, for when we're using MultiProcessor
             self._forwarder = self.forwarder()
         return self._forwarder
