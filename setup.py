@@ -13,7 +13,7 @@ install_requires = [
 
 setup(
     name='pipekit',
-    version='0.1.6',
+    version='0.1.7',
     description='Tools for flow-based programming',
     long_description=long_description,
     url='https://github.com/ncadou/pipekit',
@@ -27,6 +27,8 @@ setup(
         'Programming Language :: Python :: 3 :: Only',
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
         'Topic :: Software Development :: Libraries :: Python Modules',
     ],
     keywords='etl workflow flow-based pipe pipeline queue data processing',
