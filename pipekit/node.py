@@ -129,6 +129,27 @@ class Node(Component):
 
         return Box(settings, **dict((arg, message[msgarg]) for arg, msgarg in msgmap.items()))
 
+    __MISSING__ = object()
+
+    def named_value(self, key, message=None, default=__MISSING__, settings=None):
+        """Return `message`'s attribute named by settings' `key` element.
+
+        If `default` is provided, the element will be given this value if
+        it doesn't exist yet.
+
+        We use the `__MISSING__` value because `None` is a valid default.
+
+        """
+        if settings is None:
+            settings = self._settings
+        if default is not self.__MISSING__:
+            settings.setdefault(key, default)
+        try:
+            return getattr(message, self._settings[key])
+        except AttributeError as e:
+            if default is self.__MISSING__:
+                raise KeyError(*e.args)
+
 
 class WithRetry:
     pass
