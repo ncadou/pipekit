@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+from collections import defaultdict
 from functools import partial
 
 from box import Box
 
 _l = logging.getLogger(__name__)
+
+_events = defaultdict(asyncio.Event)
 
 
 class Component:
@@ -14,7 +17,7 @@ class Component:
 
     __instances = dict()
 
-    def __init__(self, workflow, *args, id=None, logger=_l, **kwargs):
+    def __init__(self, workflow, *args, id=None, conditions=None, logger=_l, **kwargs):
         self.workflow = workflow
         self.id = id
         if id:
@@ -24,6 +27,7 @@ class Component:
                                  f'already exists ({self.__instances[key]})')
 
             self.__instances[key] = self
+        self.conditions = conditions or []
         self.logger = logger
 
         self.parent = None
@@ -32,13 +36,12 @@ class Component:
         self._running = False
         self._paused = False
 
-        self._settings = Box(self.configure(*args, **kwargs) or dict())
+        self._settings = Box(self.configure(**kwargs) or dict())
         config_text = (' '.join(f'{k}={v}'
                                 for k, v in workflow.safe_settings(self._settings).items()))
         self.debug(f'Initialized {config_text}')
 
     def configure(self, **settings):
-        self._settings = settings
         return settings
 
     def settings(self, **settings):
@@ -52,11 +55,39 @@ class Component:
     def type(self):
         return type(self).__name__
 
+    def setevent(self, event):
+        self.debug(f'Setting event {self.id}:{event}')
+        _events[f'{self.id}:{event}'].set()
+
+    async def waiton(self, event):
+        self.debug(f'Waiting on event {event}')
+        await _events[event].wait()
+        self.debug(f'Received event {event}')
+
     def start(self):
-        self.debug('Starting')
         self._running = True
         self._paused = False
-        return self.run()
+        self.setevent('started')
+        return self._run()
+
+    async def _run(self):
+        if self.conditions:
+            for event in self.conditions:
+                await self.waiton(event)
+        self.setevent('running')
+        try:
+            await self.run()
+        except Exception:
+            self.exception()
+            self.setevent('aborted')
+            raise
+
+        else:
+            self.setevent('finished')
+        self.setevent('stopped')
+
+    async def run(self):
+        pass
 
     def stop(self):
         self.debug('Stopping')
@@ -70,9 +101,6 @@ class Component:
     def resume(self):
         self.debug('Resuming')
         self._paused = False
-
-    async def run(self):
-        self.debug('Running')
 
     def _formatted(self, msg, *args):
         prefix = f'{self.id} ' if self.id else ''

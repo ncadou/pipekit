@@ -37,7 +37,8 @@ class Node(Component):
     def _join_pipes(self, pipes, class_):
         if not isinstance(pipes, dict):
             pipes = dict(default=pipes)
-        msgbox = self.workflow.make_component(class_, id=self.id, **pipes)
+        msgbox = self.workflow.make_component(class_, id=f'{self.id}.{class_.__name__.lower()}',
+                                              **pipes)
         for channel, pipe in pipes.items():
             pipe.parent = self  # FIXME: other node overwrites .parent
         return msgbox
@@ -55,7 +56,6 @@ class Node(Component):
         return asyncio.gather(*coroutines)
 
     async def run(self):
-        await super().run()
         for layer in self.layers:
             if isinstance(layer, Component) and hasattr(layer, 'ready'):
                 self.debug(f'Waiting on layer {layer} to be ready')
