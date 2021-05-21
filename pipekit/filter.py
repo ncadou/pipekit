@@ -29,25 +29,6 @@ class ChannelChain(Filter):
                 return test_name, message
 
 
-class LifeCycleSignal(Filter):
-
-    async def filter(self, messages):
-        async for channel, message in messages:
-            yield (channel, message)
-
-            if not self.running:
-                break
-
-        settings = self.settings()
-        if settings.event == 'finished':
-            yield (settings.get('channel', 'finished'), LifeCycleMessage('finished'))
-
-
-class LifeCycleMessage(Message):
-    def __init__(self, event, **kwargs):
-        super().__init__(event=event, **kwargs)
-
-
 class MessageMangleFilter(Filter):
 
     def deepget(self, mapping, key):
