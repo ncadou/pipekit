@@ -102,6 +102,12 @@ class Workflow:
             errmsg = f'Failed to import node "{node.get("component")}" (needed by {node.key})'
             _l.exception(errmsg)
             raise ConfigurationError(errmsg)
+        if 'conditions' in node:
+            if isinstance(node.conditions, str):
+                node.conditions = [node.conditions]
+            for i, condition in enumerate(node.conditions):
+                if '.' not in condition:
+                    node.conditions[i] = f'{node.workflow}.{condition}'
 
     def _configure_pipes(self, node, msgbox):
         # Get default channels from class, if any.
@@ -212,7 +218,8 @@ class Workflow:
         ofilters = self._make_filters(node, 'ofilters')
         node_args = dict(
             id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
-            ifilters=ifilters, ofilters=ofilters, outbox=outbox, **settings)
+            ifilters=ifilters, ofilters=ofilters, outbox=outbox,
+            conditions=node.get('conditions', []), **settings)
         if isclass(node.component) and issubclass(node.component, Node):
             node_class = node.component
         elif callable(node.component):

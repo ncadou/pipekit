@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
-from collections import deque
+from collections import defaultdict, deque
 from threading import Barrier, Thread
 
 import janus
@@ -11,12 +11,15 @@ from .component import Component
 from .pipe import Manifold, Message
 from .utils import aiter, isdict, islist
 
+_events = defaultdict(asyncio.Event)
+
 
 class Node(Component):
     """Processes messages."""
 
     def configure(self, process=None, scale=None, blocking=False,
-                  inbox=None, ifilters=None, ofilters=None, outbox=None, **settings):
+                  inbox=None, ifilters=None, ofilters=None, outbox=None, conditions=None,
+                  **settings):
         if callable(process):
             self.process = process
         self.scale = int(scale or 1)
@@ -25,6 +28,7 @@ class Node(Component):
         self.ifilters = ifilters or PriorityRegistry()
         self.ofilters = ofilters or PriorityRegistry()
         self.outbox = self._join_pipes(outbox, Outbox)
+        self.conditions = conditions or []
         self.layers = list()
         return settings
 
@@ -37,10 +41,34 @@ class Node(Component):
     def _join_pipes(self, pipes, class_):
         if not isinstance(pipes, dict):
             pipes = dict(default=pipes)
-        msgbox = self.workflow.make_component(class_, id=self.id, **pipes)
+        msgbox = self.workflow.make_component(class_, id=f'{self.id}.{class_.__name__.lower()}',
+                                              **pipes)
         for channel, pipe in pipes.items():
             pipe.parent = self  # FIXME: other node overwrites .parent
         return msgbox
+
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, event):
+        self._status = event
+        self.debug(f'Emitting event {self.id}:{event}')
+        _events[f'{self.id}:{event}'].set()
+
+    async def waiton(self, event):
+        self.debug(f'Waiting on event {event}')
+        await _events[event].wait()
+        self.debug(f'Received event {event}')
+
+    @property
+    def running(self):
+        return self.status in {'started', 'running'}
+
+    @property
+    def stopped(self):
+        return self.status in {'aborted', 'finished'}
 
     def start(self, *args):
         coroutines = [super().start(*args)]
@@ -55,7 +83,21 @@ class Node(Component):
         return asyncio.gather(*coroutines)
 
     async def run(self):
-        await super().run()
+        if self.conditions:
+            for event in self.conditions:
+                await self.waiton(event)
+        self.status = 'running'
+        try:
+            await self._run()
+        except Exception:
+            self.exception()
+            self.status = 'aborted'
+            raise
+
+        else:
+            self.status = 'finished'
+
+    async def _run(self):
         for layer in self.layers:
             if isinstance(layer, Component) and hasattr(layer, 'ready'):
                 self.debug(f'Waiting on layer {layer} to be ready')

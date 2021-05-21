@@ -38,7 +38,6 @@ class Component:
         self.debug(f'Initialized {config_text}')
 
     def configure(self, **settings):
-        self._settings = settings
         return settings
 
     def settings(self, **settings):
