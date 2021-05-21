@@ -54,6 +54,10 @@ class Message:
         self._tag(component, 'out')
 
     @property
+    def data(self):
+        return self.__data
+
+    @property
     def dropped(self):
         return self.meta.dropped
 
