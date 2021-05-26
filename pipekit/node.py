@@ -83,6 +83,7 @@ class Node(Component):
         return asyncio.gather(*coroutines)
 
     async def run(self):
+        await super().run()
         if self.conditions:
             for event in self.conditions:
                 await self.waiton(event)
@@ -90,7 +91,7 @@ class Node(Component):
         try:
             await self._run()
         except Exception:
-            self.exception()
+            self.exception('Fatal error')
             self.status = 'aborted'
             raise
 
@@ -109,12 +110,8 @@ class Node(Component):
             for layer in self.layers[1:]:
                 stack = layer(stack)
             self.debug('Processing messages')
-            try:
-                async for result in stack:
-                    result
-            except Exception:
-                self.exception('Node failure')
-                raise
+            async for result in stack:
+                result
 
             self.debug('Finished processing')
 
