@@ -11,6 +11,7 @@ from string import Template
 import strictyaml
 from box import Box
 
+from .component import Component, Evented
 from .engine import ETLEngine
 from .node import Node, PriorityRegistry
 from .pipe import PipeRef
@@ -24,6 +25,8 @@ class Workflow:
         self.settings = Box(settings or {})
         self.read(source)
         self.app = None
+        self.nodes = dict()
+        self.children = list()
 
     def read(self, source):
         """Load workflow from definition source (file path or string)."""
@@ -105,9 +108,16 @@ class Workflow:
         if 'conditions' in node:
             if isinstance(node.conditions, str):
                 node.conditions = [node.conditions]
-            for i, condition in enumerate(node.conditions):
-                if '.' not in condition:
-                    node.conditions[i] = f'{node.workflow}.{condition}'
+        if 'leaf' in node:
+            if isinstance(node.leaf, str):
+                node.leaf = [node.leaf]
+            if not set(node.leaf).issubset(set(['start', 'end'])):
+                raise ConfigurationError('If provided, leaf must be "start" or "end", or both')
+            if 'start' in node.leaf and not node.get('inbox'):
+                node.inbox = dict(component='pipekit.pipe:DataPipe',
+                                  settings=dict(messages=[dict(start=True)]))
+            if 'end' in node.leaf and not node.get('outbox'):
+                node.outbox = 'pipekit.pipe:NullPipe'
 
     def _configure_pipes(self, node, msgbox):
         # Get default channels from class, if any.
@@ -164,9 +174,12 @@ class Workflow:
 
     def build(self):
         """Instantiate and wire up nodes and pipes."""
+
         _l.debug('Instantiating workflow')
         self._node_backlog = dict()
-        for workflow in self.app.workflows.values():
+        for wname, workflow in self.app.workflows.items():
+            if wname not in self.nodes:
+                self.nodes[wname] = SubFlow(self, id=wname)
             for _, node in workflow.items():
                 self._node_backlog[node.key] = node
         for node in list(self._node_backlog.values()):
@@ -177,13 +190,15 @@ class Workflow:
                 _l.exception(f'Error while instantiating node {node.key}')
                 raise
 
-    RESERVED_SETTINGS = set(['id', 'process', 'scale', 'inbox', 'ifilters', 'ofilters', 'outbox'])
+    RESERVED_SETTINGS = set(
+            'id process scale inbox ifilters ofilters outbox leaf conditions'.split())
 
     def make_node(self, node):
         """Instantiate a node and all its upstream nodes, and wire them together."""
         if node.key not in self._node_backlog:
             return
 
+        # Validate settings.
         settings = node.get('settings', {})
         reserved_settings = self.RESERVED_SETTINGS.intersection(set(settings.keys()))
         if reserved_settings:
@@ -191,6 +206,7 @@ class Workflow:
             raise ConfigurationError(f'Settings for node {node.key} contains reserved '
                                      f'key{plural}: {", ".join(reserved_settings)}')
 
+        # Instantiate input and output pipes and filters.
         outbox = dict()
         for channel, pipe in node.outbox.items():
             node.outbox[channel].instance = self.make_component(
@@ -216,10 +232,29 @@ class Workflow:
 
         ifilters = self._make_filters(node, 'ifilters')
         ofilters = self._make_filters(node, 'ofilters')
+
+        # Validate and resolve conditions.
+        parentname = node.key.rsplit('.', 1)[0]
+        parentwf = self.app.workflows[parentname]
+        for i, condition in enumerate(node.get('conditions', [])):
+            condnode = condition.rsplit(':', 1)[0]
+            if condnode in parentwf:
+                node.conditions[i] = f'{parentname}.{condition}'
+            else:
+                for wname, workflow in self.app.workflows.items():
+                    if wname == condnode and wname != parentname:
+                        break
+
+                else:
+                    raise ConfigurationError(
+                            f'Node {node.key} has an unsatisfiable condition {condition}')
+
+        # Instantiate node.
         node_args = dict(
-            id=node.key, blocking=bool(node.get('blocking')), scale=node.get('scale'), inbox=inbox,
-            ifilters=ifilters, ofilters=ofilters, outbox=outbox,
-            conditions=node.get('conditions', []), **settings)
+            id=node.key, parent=self.nodes[node.workflow],
+            inbox=inbox, ifilters=ifilters, ofilters=ofilters, outbox=outbox,
+            conditions=node.get('conditions', []), blocking=bool(node.get('blocking')),
+            scale=node.get('scale'), **settings)
         if isclass(node.component) and issubclass(node.component, Node):
             node_class = node.component
         elif callable(node.component):
@@ -282,6 +317,10 @@ class Workflow:
         """Create engine and run workflow."""
         self.engine = ETLEngine(self)
         self.engine.run()
+
+
+class SubFlow(Component, Evented):
+    pass
 
 
 def resolve(spec):

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 from .component import Component
-from .message import Message
 
 
 class Filter(Component):

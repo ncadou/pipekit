@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 
 import asyncio
-from collections import defaultdict, deque
 from threading import Barrier, Thread
 
 import janus
 from box import Box
 
-from .component import Component
+from .component import Component, Evented
 from .pipe import Manifold, Message
 from .utils import aiter, isdict, islist
 
-_events = defaultdict(asyncio.Event)
 
-
-class Node(Component):
+class Node(Component, Evented):
     """Processes messages."""
 
-    def configure(self, process=None, scale=None, blocking=False,
-                  inbox=None, ifilters=None, ofilters=None, outbox=None, conditions=None,
-                  **settings):
+    def configure(self, process=None, inbox=None, ifilters=None, ofilters=None, outbox=None,
+                  conditions=None, blocking=False, scale=None, **settings):
         if callable(process):
             self.process = process
-        self.scale = int(scale or 1)
-        self.blocking = self.__class__ is ThreadedNode or blocking
         self.inbox = self._join_pipes(inbox, Inbox)
         self.ifilters = ifilters or PriorityRegistry()
         self.ofilters = ofilters or PriorityRegistry()
         self.outbox = self._join_pipes(outbox, Outbox)
         self.conditions = conditions or []
+        self.blocking = self.__class__ is ThreadedNode or blocking
+        self.scale = int(scale or 1)
         self.layers = list()
         return settings
 
@@ -47,34 +43,11 @@ class Node(Component):
             pipe.parent = self  # FIXME: other node overwrites .parent
         return msgbox
 
-    @property
-    def status(self):
-        return self._status
-
-    @status.setter
-    def status(self, event):
-        self._status = event
-        self.debug(f'Emitting event {self.id}:{event}')
-        _events[f'{self.id}:{event}'].set()
-
-    async def waiton(self, event):
-        self.debug(f'Waiting on event {event}')
-        await _events[event].wait()
-        self.debug(f'Received event {event}')
-
-    @property
-    def running(self):
-        return self.status in {'started', 'running'}
-
-    @property
-    def stopped(self):
-        return self.status in {'aborted', 'finished'}
-
     def start(self, *args):
         coroutines = [super().start(*args)]
         self.layers = ([self.inbox] +
                        self.ifilters.ordered() +
-                       [self.spawn_processor()] +
+                       list(self.spawn_processor()) +
                        self.ofilters.ordered() +
                        [self.outbox])
         for layer in self.layers:
@@ -84,6 +57,7 @@ class Node(Component):
 
     async def run(self):
         await super().run()
+        self.status = 'started'
         if self.conditions:
             for event in self.conditions:
                 await self.waiton(event)
@@ -97,6 +71,7 @@ class Node(Component):
 
         else:
             self.status = 'finished'
+        self.status = 'exited'
 
     async def _run(self):
         for layer in self.layers:
@@ -120,11 +95,19 @@ class Node(Component):
         if self.blocking:
             raise NotImplementedError(f'Node.blocking in {self}')
 
-        if self.scale == 1:
-            return processor
+        if self.scale > 1:
+            processor = MultiProcessor(self)
 
-        elif self.scale > 1:
-            return MultiProcessor(self)
+        return self._pre_processor, processor
+
+    async def _pre_processor(self, messages):
+        """Generate an event on first message reaching the processor."""
+        first_message = True
+        async for channel, message in messages:
+            if first_message:
+                self.status = 'processing'
+                first_message = False
+            yield (channel, message)
 
     def get_processor(self):
         if isinstance(self, WithRetry):
@@ -181,13 +164,11 @@ class Node(Component):
         """
         if settings is None:
             settings = self._settings
+        attrs = settings.setdefault('attrs', {})
         if default is not self.__MISSING__:
-            settings.setdefault(key, default)
-        try:
-            return getattr(message, self._settings[key])
-        except AttributeError as e:
-            if default is self.__MISSING__:
-                raise KeyError(*e.args)
+            attrs.setdefault(key, default)
+        if hasattr(message, 'data'):
+            return message.data[attrs[key]]
 
 
 class WithRetry:
@@ -431,7 +412,7 @@ class ThreadedProcessor:
             # print(f'thread {i} EOT received back')
 
         while self.threads:  # FIXME: join threads instead, and move or retire del self.threads[]
-            asyncio.sleep(0.1)  #     while at it, catch exceptions and clean up queue with task_done  # noqa: E501
+            asyncio.sleep(0.1)  # ... while at it, catch exceptions and clean up queue with task_done  # noqa: E501
         # print(f'all threads stopped')
 
     async def thread_feeder(self, messages):
