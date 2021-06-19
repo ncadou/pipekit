@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 
 import asyncio
+from functools import partial
+from itertools import chain
 from threading import Barrier, Thread
 
 import janus
 from box import Box
 
-from .component import Component, Evented
-from .pipe import Manifold, Message
+from . import pipe
+from .component import Component, ComponentInterrupted
+from .message import Message
 from .utils import aiter, isdict, islist
 
 
-class Node(Component, Evented):
+class Node(Component):
     """Processes messages."""
 
     def configure(self, process=None, inbox=None, ifilters=None, ofilters=None, outbox=None,
@@ -21,7 +24,10 @@ class Node(Component, Evented):
         self.inbox = self._join_pipes(inbox, Inbox)
         self.ifilters = ifilters or PriorityRegistry()
         self.ofilters = ofilters or PriorityRegistry()
+        for filter_ in chain(self.ifilters.values(), self.ofilters.values()):
+            filter_.parent = self
         self.outbox = self._join_pipes(outbox, Outbox)
+        self.children = [self.inbox, self.outbox]
         self.conditions = conditions or []
         self.blocking = self.__class__ is ThreadedNode or blocking
         self.scale = int(scale or 1)
@@ -38,16 +44,16 @@ class Node(Component, Evented):
         if not isinstance(pipes, dict):
             pipes = dict(default=pipes)
         msgbox = self.workflow.make_component(class_, id=f'{self.id}.{class_.__name__.lower()}',
-                                              **pipes)
-        for channel, pipe in pipes.items():
-            pipe.parent = self  # FIXME: other node overwrites .parent
+                                              parent=self, **pipes)
         return msgbox
+
+    _dependent_statuses = {'exited'}
 
     def start(self, *args):
         coroutines = [super().start(*args)]
         self.layers = ([self.inbox] +
                        self.ifilters.ordered() +
-                       list(self.spawn_processor()) +
+                       self.spawn_processor() +
                        self.ofilters.ordered() +
                        [self.outbox])
         for layer in self.layers:
@@ -56,39 +62,42 @@ class Node(Component, Evented):
         return asyncio.gather(*coroutines)
 
     async def run(self):
-        await super().run()
-        self.status = 'started'
-        if self.conditions:
-            for event in self.conditions:
-                await self.waiton(event)
-        self.status = 'running'
-        try:
-            await self._run()
-        except Exception:
-            self.exception('Fatal error')
-            self.status = 'aborted'
-            raise
+        if not self.aborted:
+            await super().run()
+            conditions = set(self.conditions)
+            while self.running and conditions:
+                for event in conditions.copy():
+                    if self.hasstatus(f'{event.rsplit(":", 1)[0]}:aborted'):
+                        self.abort()
+                    elif self.hasstatus(event):
+                        conditions.remove(event)
+                if conditions:
+                    await asyncio.sleep(0.1)
 
-        else:
+        self.status = 'cleared'
+        if self.running:
+            try:
+                await self._run()
+            except Exception:
+                self.exception('Fatal error')
+                self.abort()
+                if False and True:  # TODO: make this configurable
+                    raise
+
+        if not self.aborted:
             self.status = 'finished'
         self.status = 'exited'
 
     async def _run(self):
-        for layer in self.layers:
-            if isinstance(layer, Component) and hasattr(layer, 'ready'):
-                self.debug(f'Waiting on layer {layer} to be ready')
-                await layer.ready.wait()
-                self.debug(f'Layer {layer} is ready')
-        # TODO: handle exceptions, and possibly restart
-        if self.running and self.inbox.running:
-            stack = self.layers[0]
-            for layer in self.layers[1:]:
-                stack = layer(stack)
-            self.debug('Processing messages')
-            async for result in stack:
-                result
+        if not self.running:
+            return
 
-            self.debug('Finished processing')
+        stack = self.layers[0]
+        for layer in self.layers[1:]:
+            stack = layer(stack)
+        async for result in stack:
+            if not self.running:
+                break
 
     def spawn_processor(self):
         processor = self.get_processor()
@@ -98,16 +107,28 @@ class Node(Component, Evented):
         if self.scale > 1:
             processor = MultiProcessor(self)
 
-        return self._pre_processor, processor
+        return [self._pre_processor, processor, self._post_processor]
 
     async def _pre_processor(self, messages):
-        """Generate an event on first message reaching the processor."""
+        """Generate an event on the first message reaching the processor."""
         first_message = True
         async for channel, message in messages:
+            if not self.running:
+                break
+
             if first_message:
-                self.status = 'processing'
+                self.status = 'processing-started'
                 first_message = False
             yield (channel, message)
+
+    async def _post_processor(self, messages):
+        """Generate an event on the last message leaving the processor."""
+        async for channel, message in messages:
+            if not self.running:
+                break
+
+            yield (channel, message)
+        self.status = 'processing-finished'
 
     def get_processor(self):
         if isinstance(self, WithRetry):
@@ -190,13 +211,13 @@ class MultiProcessor:
         if self.pending > 0:
             await self.finished.wait()
         for i in range(self.node.scale):
-            await self.iqueue.put(Message.EOT)
+            await self.iqueue.put(pipe.EOT)
 
     async def collector(self, id_):
         """Launch an instance of the node processor, and relay its output to the output queue."""
-        async for channel, message in self.processor(aiter(self.iqueue.get, Message.EOT), id_=id_):
+        async for channel, message in self.processor(aiter(self.iqueue.get, pipe.EOT), id_=id_):
             await self.oqueue.put((channel, message))
-        await self.oqueue.put((None, Message.EOT))
+        await self.oqueue.put((None, pipe.EOT))
 
     async def outfeed(self, messages):
         """Launch all processor instances and return an iterator that feeds on the output queue."""
@@ -212,7 +233,7 @@ class MultiProcessor:
         while running or not self.oqueue.empty():
             channel, message = await self.oqueue.get()
             self.oqueue.task_done()
-            if message is Message.EOT:
+            if message is pipe.EOT:
                 running -= 1
             else:
                 self.pending -= 1
@@ -226,21 +247,18 @@ class MultiProcessor:
     __call__ = outfeed
 
 
-class Inbox(Manifold):
-
-    def receive(self):
-        raise NotImplementedError(f'receive() in {self}')
+class Inbox(pipe.Manifold):
 
     async def receiver(self):
         message = None
         active_channels = 0
         last_channel = False
-        self.debug('Receiving')
-        for channel, pipe in self._active_channels():
+        self.debug('Ready to receive')
+        for channel, _pipe in self._active_channels():
             if not self.running:
                 return
 
-            if pipe is None:
+            if _pipe is None:
                 if active_channels == 1:
                     last_channel = True
                 if message is False:  # all channels are empty
@@ -252,18 +270,21 @@ class Inbox(Manifold):
 
             active_channels += 1
             try:
-                message = await pipe.receive(wait=last_channel)
+                message = await self.try_while_running(
+                        partial(_pipe.receive, wait=last_channel))
             except asyncio.QueueEmpty:
                 continue
 
+            except ComponentInterrupted:
+                return
+
             except Exception:
-                self.exception(f'Error while receiving on channel {channel}, {pipe}')
+                self.exception(f'Error while receiving on channel {channel}, {_pipe}')
                 raise
 
             self.debug(f'Got message from {channel}: {message}')
-            if message == Message.EOT:
-                self.debug('Exhausted channel: %s' % channel)
-                pipe.stop()
+            if message == pipe.EOT:
+                _pipe.stop()
             else:
                 message.checkin(self)
                 yield (channel, message)
@@ -275,12 +296,12 @@ class Inbox(Manifold):
         while active_channels:
             yield None, None  # signal start of channels sweep
 
-            for channel, pipe in active_channels.copy().items():
-                if not pipe.running:
-                    self.debug(f'skipping stopped channel {channel}')
+            for channel, _pipe in active_channels.copy().items():
+                if not _pipe.running:
+                    self.debug(f'Skipping stopped channel {channel}')
                     del active_channels[channel]
                 else:
-                    yield channel, pipe
+                    yield channel, _pipe
 
     async def channel_receiver(self, channel, feeder, events):
         self.debug(f'Receiver for {channel} is ready')
@@ -298,7 +319,7 @@ class Inbox(Manifold):
 
 
 class RetryableMessages:
-    """Interfaces a queue between the inbox and the processor where we can insert back retries."""
+    """Queue sitting between the inbox and the processor where retries can be inserted back."""
 
     def __init__(self, node, messages):
         self.node = node
@@ -312,14 +333,18 @@ class RetryableMessages:
 
     async def feeder(self):
         """Feed the inbox to the queue."""
-        async for channel, self.newmsg in self.messages:
-            self.forwarded.clear()
-            await self.queue.put((channel, self.newmsg))
-            await self.forwarded.wait()
-        self.exhausted = True
-        if self.pending > 0:
-            await self.finished.wait()
-        await self.queue.put(Message.EOT)
+        try:
+            async for channel, self.newmsg in self.messages:
+                self.forwarded.clear()
+                await self.queue.put((channel, self.newmsg))
+                await self.node.try_while_running(partial(self.forwarded.wait))
+            self.exhausted = True
+            if self.pending > 0:
+                await self.node.try_while_running(partial(self.finished.wait))
+        except ComponentInterrupted:
+            pass
+        finally:
+            await self.queue.put(pipe.EOT)
 
     async def forwarder(self):
         """Turn the queue into an iterator that the processor can consume."""
@@ -330,7 +355,8 @@ class RetryableMessages:
         self.newmsg = None
         self.pending = 0  # number of messages currently handled by node processor
         feeder = self.node.loop.create_task(self.feeder())
-        async for channel, message in aiter(self.queue.get, Message.EOT):
+
+        async for channel, message in aiter(self.queue.get, pipe.EOT):
             self.queue.task_done()
             if message is self.newmsg:
                 self.forwarded.set()
@@ -353,20 +379,41 @@ class RetryableMessages:
         self.processing_done()
 
 
-class Outbox(Manifold):
+class Outbox(pipe.Manifold):
     def __call__(self, messages):
-        return self.sender(messages)
+        return self._sender(messages)
+
+    async def _sender(self, messages):
+        self.debug('Ready to send')
+        try:
+            async for channel, message in self.sender(messages):
+                yield channel, message
+
+        except Exception:
+            self.status = 'aborted'
+            raise
+
+        else:
+            self.status = 'finished'
+        finally:
+            self.status = 'exited'
 
     async def sender(self, messages):
-        self.debug('Ready to send')
         async for channel, message in messages:
             channel = channel or 'default'
+            if not self.running:
+                break
+
             if channel is Message.DROP:
                 self.drop(message)
             else:
                 self.debug(f'Sending message to {channel}: {message}')
                 if channel in self.channels:
-                    await self.channels[channel].send(message)
+                    try:
+                        await self.try_while_running(partial(self.channels[channel].send, message))
+                    except ComponentInterrupted:
+                        break
+
                     message.checkout(self)
                     yield channel, message
 
@@ -374,9 +421,11 @@ class Outbox(Manifold):
                     raise KeyError(f'Channel "{channel}" does not exist in {self}')
 
         self.debug('Finished sending')
-        for pipe in self.channels.values():
-            self.debug(f'EOT to {pipe}')
-            await pipe.send(Message.EOT)
+        try:
+            for _pipe in self.channels.values():
+                await self.try_while_running(partial(_pipe.send, pipe.EOT))
+        except ComponentInterrupted:
+            pass
 
 
 class ThreadedNode(Node):
@@ -399,7 +448,7 @@ class ThreadedProcessor:
         asyncio.ensure_future(self.thread_feeder(messages))
         self.threads = dict((i, Thread(target=self.thread_consumer, args=(i,)).start())
                             for i in range(self.scale))
-        queue_iter = aiter(self.oqueue.async_q.get, (None, Message.EOT))
+        queue_iter = aiter(self.oqueue.async_q.get, (None, pipe.EOT))
         async for channel, message in queue_iter:
             self.oqueue.async_q.task_done()
             yield channel, message
@@ -420,12 +469,12 @@ class ThreadedProcessor:
             # TODO: recreate dead threads, report thread failures
             await self.iqueue.async_q.put((channel, message))
         for i in range(self.scale):
-            await self.iqueue.async_q.put((None, Message.EOT))
+            await self.iqueue.async_q.put((None, pipe.EOT))
             # print(f'thread {i} EOT sent')
 
     def thread_consumer(self, threadnum):  # runs in thread
         # print(f'thread {threadnum} started')
-        queue_iter = iter(self.iqueue.sync_q.get, (None, Message.EOT))
+        queue_iter = iter(self.iqueue.sync_q.get, (None, pipe.EOT))
         for channel, message in self.processor(queue_iter):
             self.iqueue.sync_q.task_done()
             self.oqueue.sync_q.put((channel, message))
@@ -433,7 +482,7 @@ class ThreadedProcessor:
         self.iqueue.sync_q.task_done()  # for EOT which does not make it past queue iterator
         # print(f'thread {threadnum} task done')
         self.barrier.wait()
-        self.oqueue.sync_q.put((None, Message.EOT))  # TODO: use threading.Event to send just one
+        self.oqueue.sync_q.put((None, pipe.EOT))  # TODO: use threading.Event to send just one
         # print(f'thread {threadnum} EOT sent back')
         del self.threads[threadnum]
         # print(f'thread {threadnum} stopped')

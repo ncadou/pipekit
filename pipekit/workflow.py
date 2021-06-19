@@ -11,7 +11,7 @@ from string import Template
 import strictyaml
 from box import Box
 
-from .component import Component, Evented
+from .component import Component
 from .engine import ETLEngine
 from .node import Node, PriorityRegistry
 from .pipe import PipeRef
@@ -20,15 +20,15 @@ from .utils import isdict, islist, isstr
 _l = logging.getLogger(__name__)
 
 
-class Workflow:
-    def __init__(self, source, settings=None):
-        self.settings = Box(settings or {})
-        self.read(source)
+class Workflow(Component):
+
+    def configure(self, **settings):
+        self.read(settings['source'], Box(settings))
         self.app = None
         self.nodes = dict()
-        self.children = list()
+        return super().configure(**settings)
 
-    def read(self, source):
+    def read(self, source, settings):
         """Load workflow from definition source (file path or string)."""
         self.source = source
         if source == '-':
@@ -36,7 +36,7 @@ class Workflow:
         else:
             try:
                 params = os.environ.copy()
-                params.update(self.settings.params)
+                params.update(settings.params)
                 source = Template(Path(source).read_text()).substitute(params)
             except FileNotFoundError:
                 self.source = None
@@ -74,36 +74,38 @@ class Workflow:
         return element
 
     def load(self):
-        _l.info(f'Loading workflow from {self.source}')
+        self.info(f'Loading workflow from {self.source}')
         if self.app:
             raise RuntimeError('Workflow has already been loaded')
 
         self.app = Box(self.definition.to_dict(), box_dots=True)
-        self.configure()
+        self.prepare()
         self.build()
 
-    def configure(self):
+    def prepare(self):
         """Locate and configure components."""
-        _l.debug('Configuring workflow')
+        self.debug('Configuring workflow')
         for wname, workflow in self.app.workflows.items():
             for nname, node in workflow.items():
-                node.workflow = wname
-                node.key = f'{wname}.{nname}'
-                self._configure_node(node)
-                node.setdefault('outbox', dict(default=None))
-                for msgbox in ('inbox', 'outbox'):
-                    self._configure_pipes(node, msgbox)
+                if nname != 'settings':
+                    node.workflow = wname
+                    node.key = f'{wname}.{nname}'
+                    self._configure_node(node)
+                    node.setdefault('outbox', dict(default=None))
+                    for msgbox in ('inbox', 'outbox'):
+                        self._configure_pipes(node, msgbox)
         for wname, workflow in self.app.workflows.items():
-            for node in workflow.values():
-                for msgbox in ('inbox', 'outbox'):
-                    self._configure_connections(node, msgbox)
+            for nname, node in workflow.items():
+                if nname != 'settings':
+                    for msgbox in ('inbox', 'outbox'):
+                        self._configure_connections(node, msgbox)
 
     def _configure_node(self, node):
         try:
             node.component = resolve(node.component)
         except Exception:
             errmsg = f'Failed to import node "{node.get("component")}" (needed by {node.key})'
-            _l.exception(errmsg)
+            self.exception(errmsg)
             raise ConfigurationError(errmsg)
         if 'conditions' in node:
             if isinstance(node.conditions, str):
@@ -175,19 +177,21 @@ class Workflow:
     def build(self):
         """Instantiate and wire up nodes and pipes."""
 
-        _l.debug('Instantiating workflow')
+        self.debug('Instantiating workflow')
         self._node_backlog = dict()
         for wname, workflow in self.app.workflows.items():
             if wname not in self.nodes:
-                self.nodes[wname] = SubFlow(self, id=wname)
+                self.debug(f'Creating workflow {wname}')
+                settings = workflow.pop('settings', {})
+                self.nodes[wname] = SubWorkflow(id=wname, workflow=self, parent=self, **settings)
             for _, node in workflow.items():
                 self._node_backlog[node.key] = node
         for node in list(self._node_backlog.values()):
             try:
-                _l.info(f'Creating node {node.key}')
+                self.debug(f'Creating node {node.key}')
                 self.make_node(node)
             except Exception:
-                _l.exception(f'Error while instantiating node {node.key}')
+                self.exception(f'Error while instantiating node {node.key}')
                 raise
 
     RESERVED_SETTINGS = set(
@@ -210,7 +214,7 @@ class Workflow:
         outbox = dict()
         for channel, pipe in node.outbox.items():
             node.outbox[channel].instance = self.make_component(
-                pipe.component, id=f'{node.key}.output.{channel}', **pipe.get('settings', {}))
+                pipe.component, id=f'{node.key}.outbox.{channel}', **pipe.get('settings', {}))
             outbox[channel] = node.outbox[channel].instance
 
         inbox = dict()
@@ -227,7 +231,7 @@ class Workflow:
 
             else:
                 pipe.instance = self.make_component(
-                    pipe.component, id=f'{node.key}.input.{channel}', **pipe.get('settings', {}))
+                    pipe.component, id=f'{node.key}.inbox.{channel}', **pipe.get('settings', {}))
             inbox[channel] = pipe.instance
 
         ifilters = self._make_filters(node, 'ifilters')
@@ -294,7 +298,7 @@ class Workflow:
         return node, channel
 
     def make_component(self, class_, *args, **kwargs):
-        return class_(self, *args, **kwargs)
+        return class_(*args, workflow=self, **kwargs)
 
     _SECRETS = set('account password secret'.split())
 
@@ -319,7 +323,7 @@ class Workflow:
         self.engine.run()
 
 
-class SubFlow(Component, Evented):
+class SubWorkflow(Component):
     pass
 
 

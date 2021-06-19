@@ -3,6 +3,8 @@
 import asyncio
 import logging
 
+from pipekit.component import ComponentInterrupted
+
 _l = logging.getLogger(__name__)
 
 
@@ -15,8 +17,13 @@ class ETLEngine:
 
     def run(self):
         loop = asyncio.get_event_loop()
-        _l.info(f'Running workflows from ({self.workflow.source})')
+        _l.info(f'Workflow started ({self.workflow.source})')
         loop.run_until_complete(asyncio.gather(*list(
             n.instance.start() for w in self.workflows.values() for n in w.values())))
-        _l.info(f'Workflows ended ({self.workflow.source})')
+        _l.info(f'Workflow ended ({self.workflow.source})')
+        for task in asyncio.Task.all_tasks():
+            try:
+                task.get_coro().throw(ComponentInterrupted)
+            except RuntimeError:
+                pass
         loop.close()

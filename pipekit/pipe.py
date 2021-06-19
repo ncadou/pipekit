@@ -3,27 +3,26 @@
 import asyncio
 import logging
 
-from .component import Component
+from .component import Component, LocalEvents
 from .message import Message
-from .utils import aiter
 
 _l = logging.getLogger(__name__)
 
 
-class Pipe(Component):
+class Pipe(Component, LocalEvents):
     """Message transit mechanism."""
 
     def __aiter__(self):
-        return self.receiver()
+        return self._receiver()
 
     def __str__(self):
         return f'<{self.__class__.__name__} {self.id}>'
 
     async def send(self, message, **kwargs):
-        raise NotImplementedError(f'send() out {self}')
+        raise NotImplementedError(f'{self}.send()')
 
     async def sender(self, messages):
-        raise NotImplementedError(f'sender() out {self}')
+        raise NotImplementedError(f'{self}.sender()')
 
         yield
 
@@ -32,12 +31,57 @@ class Pipe(Component):
             message.drop(self)
 
     async def receive(self, **kwargs):
-        raise NotImplementedError(f'receive() out {self}')
+        raise NotImplementedError(f'{self}.receive()')
+
+    async def _receiver(self):
+        self.status = 'running'
+        try:
+            async for message in self.receiver():
+                if not self.running:
+                    break
+
+                yield message
+
+        except Exception:
+            self.status = 'aborted'
+            raise
+
+        else:
+            self.status = 'finished'
+        finally:
+            self.status = 'exited'
 
     async def receiver(self):
-        raise NotImplementedError(f'receiver() out {self}')
+        raise NotImplementedError(f'{self}.receiver()')
 
-        yield
+
+class Sentinel:
+    """Used to signal the end of transmission of a queue."""
+
+    def __init__(self, type_):
+        self.type = type_
+
+    def __repr__(self):
+        return str(self)
+
+    def __str__(self):
+        return f'__{self.type}__'
+
+    def __bytes__(self):
+        return self.__str__().encode()
+
+    def __eq__(self, other):
+        if isinstance(other, bytes):
+            return self.__bytes__() == other
+
+        elif isinstance(other, str):
+            return self.__str__() == other
+
+        else:
+            return self is other
+
+
+EOT = Sentinel('EOT')
 
 
 class PipeRef:
@@ -62,6 +106,7 @@ class Manifold(Pipe):
     def configure(self, buffersize=1, **channels):
         self.buffersize = buffersize
         self.channels = channels
+        self.children = list(channels.values())
         self.ready = asyncio.Event()
         return channels
 
@@ -70,12 +115,10 @@ class Manifold(Pipe):
                               ', '.join('%s:%s' % (n, p.id)
                                         for n, p in self.channels.items()))
 
-    async def run(self):
-        await super().run()
-        for pipe in self.channels.values():
-            if not pipe.running:
-                await pipe.start()
-        self.ready.set()
+    _dependent_statuses = set()
+
+    def start(self):
+        return asyncio.gather(super().start(), *(c.start() for c in self.children))
 
 
 class NullPipe(Pipe):
@@ -99,10 +142,11 @@ class DataPipe(Pipe):
 
     async def receive(self, wait=True):
         try:
-            return self.messages.pop(-1)
+            return self.messages.pop()
 
         except IndexError:
-            return Message.EOT
+            self.status = 'finished'
+            return EOT
 
     async def receiver(self):
         while self.running:
@@ -122,14 +166,17 @@ class QueuePipe(Pipe):
 
     async def receive(self, wait=True):
         if not self.running:
-            return Message.EOT
+            return EOT
 
         if wait:
             message = await self._queue.get()
         else:
             message = self._queue.get_nowait()
+        if message == EOT:
+            self.status = 'finished'
         self._queue.task_done()
         return message
 
     async def receiver(self):
-        return aiter(self.receive, Message.EOT)
+        while self.running:
+            yield await self.receive()
