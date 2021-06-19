@@ -69,27 +69,3 @@ class Message:
 
     def _tag(self, component, tag):
         self.meta.history.append((datetime.utcnow(), component.id, tag))
-
-    class __EOT__:
-        """Used to signal the end of transmission of a queue."""
-
-        def __repr__(self):
-            return str(self)
-
-        def __str__(self):
-            return '__EOT__'
-
-        def __bytes__(self):
-            return b'__EOT__'
-
-        def __eq__(self, other):
-            if isinstance(other, bytes):
-                return self.__bytes__() == other
-
-            elif isinstance(other, str):
-                return self.__str__() == other
-
-            else:
-                return self is other
-
-    EOT = __EOT__()
