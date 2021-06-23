@@ -47,7 +47,7 @@ class Node(Component):
                                               parent=self, **pipes)
         return msgbox
 
-    _dependent_statuses = {'exited'}
+    _dependent_statuses = set()
 
     def start(self, *args):
         coroutines = [super().start(*args)]
