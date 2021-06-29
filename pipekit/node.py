@@ -78,9 +78,9 @@ class Node(Component):
         if self.running:
             try:
                 await self._run()
-            except Exception:
+            except Exception as exc:
                 self.exception('Fatal error')
-                self.abort()
+                self.abort(exc)
                 if False and True:  # TODO: make this configurable
                     raise
 
