@@ -78,9 +78,9 @@ class Node(Component):
         if self.running:
             try:
                 await self._run()
-            except Exception:
+            except Exception as exc:
                 self.exception('Fatal error')
-                self.abort()
+                self.abort(exc)
                 if False and True:  # TODO: make this configurable
                     raise
 
@@ -340,6 +340,8 @@ class RetryableMessages:
                 await self.node.try_while_running(partial(self.forwarded.wait))
             self.exhausted = True
             if self.pending > 0:
+                self.node.debug(
+                        f'RetryableMessages waiting to exit: {self.pending} pending messages')
                 await self.node.try_while_running(partial(self.finished.wait))
         except ComponentInterrupted:
             pass

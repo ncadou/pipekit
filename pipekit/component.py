@@ -72,40 +72,43 @@ class Component:
     _dependent_statuses = {'processing-finished', 'finished', 'exited'}
 
     def _status_setter(self, status):
-        if status in self._dependent_statuses:
+        event = status if isinstance(status, ComponentEvent) else ComponentEvent(status, self)
+        if event.status in self._dependent_statuses:
             children = set(filter(lambda c: isinstance(c, Component), self.children))
-            ready = set(filter(lambda c: c.hasstatus(status), children))
+            ready = set(filter(lambda c: c.hasstatus(event.status), children))
             if len(children) > len(ready):
                 if 'events' in self._debug:
                     pending = ", ".join(c.id for c in children.difference(ready))
-                    self.debug(f'Status "{status}" waiting on {pending}')
+                    self.debug(f'Status "{event.status}" waiting on {pending}')
                 return
 
-        if self.hasstatus('aborted') and status != 'exited':
+        if self.hasstatus('aborted') and event.status != 'exited':
             if 'events' in self._debug:
-                self.debug(f'Ignoring status "{status}" because the component is in aborted state')
+                self.debug(f'Ignoring status "{event.status}" because the component is '
+                           'in aborted state')
             return
 
-        event = self._fqevent(status)
+        # event.id = self._fqevent(status)
         if 'events' in self._debug:
-            self.debug(f'Emitting event "{event}"')
-        self._status = status
-        _events[event].set()
+            self.debug(f'Emitting event "{event.id}"')
+        self._status = event.status
+        _events[event.id].set()
         for queue in _event_queues:
             queue.put_nowait(event)
-        if self.parent and status != 'aborted' and not isinstance(self, LocalEvents):
-            self.parent.status = status
-        for callback in _event_callbacks[event]:
+        if self.parent and event.status != 'aborted' and not isinstance(self, LocalEvents):
+            self.parent.status = event.status
+        for callback in _event_callbacks[event.id]:
             asyncio.ensure_future(callback())
-        _event_callbacks[event].clear()
-
-    def _fqevent(self, event):
-        """Return fully qualified representation of event."""
-        return f'{self.id}:{event}'
+        _event_callbacks[event.id].clear()
 
     def hasstatus(self, status):
         """Return `True` if given status was set."""
-        event = self._fqevent(status) if ':' not in status else status
+        if isinstance(status, ComponentEvent):
+            event = status.id
+        elif ':' in status:
+            event = status
+        else:
+            event = ComponentEvent(status, self).id
         return _events[event].is_set()
 
     async def waiton(self, event):
@@ -142,11 +145,11 @@ class Component:
     def stop(self):
         self.debug('Stopping')
 
-    def abort(self):
+    def abort(self, exception=None):
         if self.hasstatus('aborted'):
             return
 
-        self.status = 'aborted'
+        self.status = ComponentEvent('aborted', self, exception)
         for child in self.children:
             if child.settings().get('error-propagation') in ('none', 'up'):
                 if 'events' in self._debug:
@@ -198,6 +201,18 @@ class Component:
                 pass
 
         raise ComponentInterrupted
+
+
+class ComponentEvent:
+    def __init__(self, status, component, exception=None):
+        self.status = status
+        self.component = component
+        self.exception = exception
+
+    @property
+    def id(self):
+        """Return a fully qualified ID string representing this event."""
+        return f'{self.component.id}:{self.status}'
 
 
 class LocalEvents:
