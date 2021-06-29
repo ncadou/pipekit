@@ -340,6 +340,8 @@ class RetryableMessages:
                 await self.node.try_while_running(partial(self.forwarded.wait))
             self.exhausted = True
             if self.pending > 0:
+                self.node.debug(
+                        f'RetryableMessages waiting to exit: {self.pending} pending messages')
                 await self.node.try_while_running(partial(self.finished.wait))
         except ComponentInterrupted:
             pass
