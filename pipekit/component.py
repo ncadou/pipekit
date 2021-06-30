@@ -165,7 +165,7 @@ class Component:
             elif not self.parent.hasstatus('aborted'):
                 if 'events' in self._debug:
                     self.debug(f'Propagating error to parent {self.parent.id}')
-                self.parent.abort()
+                self.parent.abort(exception)
 
     def __getattr__(self, name):
         if name not in ('critical', 'error', 'warning', 'info', 'debug', 'exception'):
