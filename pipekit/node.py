@@ -324,39 +324,47 @@ class RetryableMessages:
     def __init__(self, node, messages):
         self.node = node
         self.messages = messages
-        self._forwarder = None
+        self._queueiter = None
 
     def __aiter__(self):
-        if self._forwarder is None:  # singleton forwarder, for when we're using MultiProcessor
-            self._forwarder = self.forwarder()
-        return self._forwarder
+        if self._queueiter is None:  # singleton queueiter, for when we're using MultiProcessor
+            self._queueiter = self.queueiter()
+        return self._queueiter
 
-    async def feeder(self):
+    async def infeed(self):
         """Feed the inbox to the queue."""
+
+        async def enqueue(channel, message):
+            self.forwarded.clear()
+            await self.queue.put((channel, message))
+            await self.node.try_while_running(partial(self.forwarded.wait))
+
         try:
             async for channel, self.newmsg in self.messages:
-                self.forwarded.clear()
-                await self.queue.put((channel, self.newmsg))
-                await self.node.try_while_running(partial(self.forwarded.wait))
+                await enqueue(channel, self.newmsg)
+            while self.node.running and not self._retry_queue.empty():
+                channel, self.newmsg = await self._retry_queue.get()
+                await enqueue(channel, self.newmsg)
             self.exhausted = True
             if self.pending > 0:
                 self.node.debug(
                         f'RetryableMessages waiting to exit: {self.pending} pending messages')
-                await self.node.try_while_running(partial(self.finished.wait))
+                await self.node.try_while_running(partial(self.all_processing_done.wait))
         except ComponentInterrupted:
             pass
         finally:
             await self.queue.put(pipe.EOT)
 
-    async def forwarder(self):
+    async def queueiter(self):
         """Turn the queue into an iterator that the processor can consume."""
         self.queue = asyncio.Queue()
+        self._retry_queue = asyncio.Queue()
         self.forwarded = asyncio.Event()
-        self.finished = asyncio.Event()
+        self.all_processing_done = asyncio.Event()
         self.exhausted = False
         self.newmsg = None
         self.pending = 0  # number of messages currently handled by node processor
-        feeder = self.node.loop.create_task(self.feeder())
+        infeed = self.node.loop.create_task(self.infeed())
 
         async for channel, message in aiter(self.queue.get, pipe.EOT):
             self.queue.task_done()
@@ -366,18 +374,19 @@ class RetryableMessages:
             yield channel, message
 
         self.queue.task_done()
-        await feeder
+        await infeed
 
     def processing_done(self):
         """Signal that a message is not in the processor anymore."""
         self.pending -= 1
         if self.exhausted:
-            self.finished.set()
+            self.all_processing_done.set()
 
-    async def retry(self, channel, message, wait=0.001, id_=None):
+    async def retry(self, channel, message, now=True, wait=0.001, id_=None):
         """Insert a message back into the queue for retrying it."""
-        await asyncio.sleep(wait)
-        await self.node.loop.create_task(self.queue.put((channel, message)))
+        await asyncio.sleep(wait)  # tight loop mitigation
+        queue = self.queue if self.exhausted else self._retry_queue
+        await queue.put((channel, message))
         self.processing_done()
 
 
