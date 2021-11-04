@@ -137,6 +137,10 @@ class Node(Component):
     def drop(self, message):  # TODO: implement message accounting and leak detection
         self._processor.drop(message)
 
+    async def retry(self, channel, message, wait=0.001):
+        """Insert a message back into the queue for retrying it."""
+        await self._processor.retry(channel, message, wait)
+
     def merged_settings(self, message, key=None, msgmap=None):
         """Return node settings, with values overridden from the message if present."""
         settings = self.settings.to_dict()
@@ -196,10 +200,23 @@ class ProcessorWrapper:
         for i in range(self.node.scale * 2):
             await self.iqueue.put(pipe.EOT)
 
+    async def _get_input(self):
+        wait = self.iwait
+        while self.node.running:
+            for queue in (self.rqueue, self.iqueue):  # try retry queue before input queue
+                try:
+                    return queue.get_nowait()
+
+                except asyncio.QueueEmpty:
+                    pass
+            await asyncio.sleep(wait)
+            if wait < 0.1:
+                wait *= 2
+
     async def collector(self, id_):
         """Launch an instance of the node processor, and relay its output to the output queue."""
         try:
-            async for channel, message in self.node.processor(aiter(self.iqueue.get, pipe.EOT, id_), id_=id_):  # noqa: E501
+            async for channel, message in self.node.processor(aiter(self._get_input, pipe.EOT, id_), id_=id_):  # noqa: E501
                 await self.oqueue.put((channel, message))
             await self.oqueue.put((None, pipe.EOT))
         except Exception as e:
@@ -209,7 +226,9 @@ class ProcessorWrapper:
     async def outfeed(self, messages):
         """Launch all processor instances and return an iterator that feeds on the output queue."""
         self.iqueue = asyncio.Queue(maxsize=self.node.scale)  # input queue
+        self.rqueue = asyncio.Queue()                         # retry queue
         self.oqueue = asyncio.Queue(maxsize=1)                # output queue
+        self.iwait = 0.001  # initial scaleback wait value for input queue
         self.pending = dict()  # messages currently handled by node processor
         coroutines = list()
         for i in range(self.node.scale):
@@ -234,11 +253,17 @@ class ProcessorWrapper:
         self.pending.pop(f'{id(message)}-{message.meta.id}', None)
         message.drop(component or self.node)
 
-    async def retry(self, channel, message, now=True, wait=0.001, id_=None):
+    async def retry(self, channel, message, wait=0.01):
         """Insert a message back into the queue for retrying it."""
-        await asyncio.sleep(wait)  # tight loop mitigation
+        self.node.debug(f'Retrying message {message}')
         self.pending[f'{id(message)}-{message.meta.id}'] = message
-        await self.iqueue.put((channel, message))
+
+        async def retry(channel, message, wait):
+            await asyncio.sleep(wait)  # tight loop mitigation
+            await self.rqueue.put((channel, message))
+
+        # Schedule push to retry queue to free up caller.
+        asyncio.ensure_future(retry(channel, message, wait))
 
     __call__ = outfeed
 
