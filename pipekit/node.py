@@ -186,6 +186,8 @@ class ProcessorWrapper:
 
     def __init__(self, node):
         self.node = node
+        self.running = True
+        self.exc = None
 
     async def infeed(self, messages):
         """Loop through all messages from the inbox and relay them to the input queue."""
@@ -197,31 +199,32 @@ class ProcessorWrapper:
             if pending != len(self.pending):
                 pending = len(self.pending)
             await asyncio.sleep(0.1)
-        for i in range(self.node.scale * 2):
-            await self.iqueue.put(pipe.EOT)
+        self.running = False
 
-    async def _get_input(self):
+    async def _input_iter(self):
         wait = self.iwait
-        while self.node.running:
-            for queue in (self.rqueue, self.iqueue):  # try retry queue before input queue
+        while self.node.running and self.running:
+            input_is_empty = True
+            for queue in (self.rqueue, self.iqueue):
                 try:
-                    return queue.get_nowait()
+                    yield queue.get_nowait()
 
+                    input_is_empty = False
                 except asyncio.QueueEmpty:
                     pass
-            await asyncio.sleep(wait)
-            if wait < 0.1:
-                wait *= 2
+
+            if input_is_empty:
+                await asyncio.sleep(wait)
+                if wait < 0.1:
+                    wait *= 2
+            else:
+                wait = self.iwait
 
     async def collector(self, id_):
         """Launch an instance of the node processor, and relay its output to the output queue."""
-        try:
-            async for channel, message in self.node.processor(aiter(self._get_input, pipe.EOT, id_), id_=id_):  # noqa: E501
-                await self.oqueue.put((channel, message))
-            await self.oqueue.put((None, pipe.EOT))
-        except Exception as e:
-            self.node.exception(f'Exception in collector-{id_}: {e}')
-            raise
+        async for channel, message in self.node.processor(self._input_iter(), id_=id_):
+            await self.oqueue.put((channel, message))
+        await self.oqueue.put((None, pipe.EOT))
 
     async def outfeed(self, messages):
         """Launch all processor instances and return an iterator that feeds on the output queue."""
@@ -235,8 +238,30 @@ class ProcessorWrapper:
             coroutines.append(asyncio.ensure_future(self.collector(i)))
         coroutines.append(asyncio.ensure_future(self.infeed(messages)))
         running = self.node.scale
+        wait = self.iwait
 
         while running or not self.oqueue.empty():
+            if self.oqueue.empty():
+                # Raise any exception from collectors.
+                for coroutine in coroutines:
+                    try:
+                        # self.node.debug('*** error?')
+                        coroutine.result()
+                    except asyncio.InvalidStateError:
+                        # self.node.debug('*** nope')
+                        pass
+
+                if self.node.hasstatus('aborted'):
+                    break
+
+                await asyncio.sleep(wait)
+                if wait < 0.1:
+                    wait *= 2
+                continue
+
+            else:
+                wait = self.iwait
+
             channel, message = await self.oqueue.get()
             self.oqueue.task_done()
             if message is pipe.EOT:
@@ -245,8 +270,14 @@ class ProcessorWrapper:
                 self.pending.pop(f'{id(message)}-{message.meta.id}', None)
                 yield channel, message
 
+        self.running = False
         for coroutine in coroutines:
-            await coroutine
+            if self.node.hasstatus('aborted'):
+                coroutine.cancel()
+            try:
+                await coroutine
+            except asyncio.CancelledError:
+                pass
 
     def drop(self, message, component=None):
         """Drop message and stop tracking it."""

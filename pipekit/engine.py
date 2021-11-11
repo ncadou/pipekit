@@ -24,6 +24,6 @@ class ETLEngine:
         for task in asyncio.Task.all_tasks():
             try:
                 task.get_coro().throw(ComponentInterrupted)
-            except RuntimeError:
+            except (RuntimeError, ComponentInterrupted):
                 pass
         loop.close()

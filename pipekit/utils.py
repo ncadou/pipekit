@@ -116,7 +116,7 @@ class StreamedResponseFile(ThreadRunner):
         await self.close()
 
 
-async def aiter(object, sentinel=__MISSING__, id_=None):
+async def aiter(object, sentinel=__MISSING__):
     """Async version of the iter() built-in."""
     if sentinel is __MISSING__:
         async for item in object:
@@ -124,7 +124,11 @@ async def aiter(object, sentinel=__MISSING__, id_=None):
 
     else:
         while True:
-            item = await object()
+            try:
+                item = await object()
+            except StopAsyncIteration:
+                break
+
             if item == sentinel:
                 break
 
