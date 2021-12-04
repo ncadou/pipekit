@@ -21,6 +21,25 @@ pretty straightforward:
 
 .. code:: python
 
+   import asyncio
+
+   from pipekit.pipe import QueuePipe
+
+   async def main():
+       mypipe = QueuePipe('my-pipe')
+       await mypipe.start()
+       await mypipe.send('Hello world')
+       print(await mypipe.receive())
+    
+   asyncio.run(main())
+   # Hello world
+
+The current examples are still being worked on:
+
+
+
+.. code:: python
+
     from pipekit import ThreadPipe
 
     # Pipes need to be given a name
