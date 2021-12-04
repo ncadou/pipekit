@@ -158,8 +158,9 @@ class DataPipe(Pipe):
 
 
 class QueuePipe(Pipe):
-    def configure(self, queue=None, maxsize=1):
+    def configure(self, queue=None, maxsize=1, **kwargs):
         self._queue = queue or asyncio.Queue(maxsize=maxsize)
+        return kwargs
 
     async def send(self, *args, **kwargs):
         return await self._queue.put(*args, **kwargs)

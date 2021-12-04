@@ -40,7 +40,7 @@ class Component:
         self._event_lock = set()
         self._debug = {'events'}
 
-        self._settings = Box(self.configure(*args, **kwargs) or dict())
+        self._settings = Box(self.configure(**kwargs) or dict())
         if not workflow:
             workflow = self
         settings = [f'{k}={v}' for k, v in workflow.safe_settings(self._settings).items()]
@@ -51,6 +51,9 @@ class Component:
 
     def settings(self, **override):
         return Box(self._settings, **override)
+
+    def safe_settings(self, settings):
+        return settings
 
     @property
     def type(self):
@@ -175,7 +178,10 @@ class Component:
 
     def _proxied_logging_method(self, method, *args, **kwargs):
         if method == 'debug':
-            debug = (self.workflow or self).settings().logging.debug
+            if logging in (self.workflow or self).settings():
+                debug = (self.workflow or self).settings().logging.debug
+            else:
+                debug = []
             if not ('all' in debug or self.type in debug or (self.id in debug)):
                 return lambda *a, **kw: None
 
