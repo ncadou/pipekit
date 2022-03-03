@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+from collections import OrderedDict
 from functools import partial
 from itertools import chain
 from threading import Barrier, Thread
@@ -137,9 +138,9 @@ class Node(Component):
     def drop(self, message):  # TODO: implement message accounting and leak detection
         self._processor.drop(message)
 
-    async def retry(self, channel, message, wait=0.001):
-        """Insert a message back into the queue for retrying it."""
-        await self._processor.retry(channel, message, wait)
+    async def retry(self, channel=None, message=None, key=None, wait=False):
+        """Insert a message back into the input queue for retrying it."""
+        await self._processor.retry(channel, message, key, wait)
 
     def merged_settings(self, message, key=None, msgmap=None):
         """Return node settings, with values overridden from the message if present."""
@@ -188,12 +189,17 @@ class ProcessorWrapper:
         self.node = node
         self.running = True
         self.exc = None
+        self.backlog = OrderedDict()
 
     async def infeed(self, messages):
         """Loop through all messages from the inbox and relay them to the input queue."""
         async for channel, message in messages:
             self.pending[f'{id(message)}-{message.meta.id}'] = message
             await self.iqueue.put((channel, message))
+        if self.backlog:
+            self.node.debug('No more messages, processing backlog')
+            for channel, message in self.backlog.copy().values():
+                await self.rqueue.put((channel, message))
         pending = None
         while self.pending and self.node.running:
             if pending != len(self.pending):
@@ -284,17 +290,30 @@ class ProcessorWrapper:
         self.pending.pop(f'{id(message)}-{message.meta.id}', None)
         message.drop(component or self.node)
 
-    async def retry(self, channel, message, wait=0.01):
-        """Insert a message back into the queue for retrying it."""
+    async def retry(self, channel=None, message=None, key=None, wait=False):
+        """Insert a message back into the input queue for retrying it."""
         self.node.debug(f'Retrying message {message}')
-        self.pending[f'{id(message)}-{message.meta.id}'] = message
+        if message:
+            self.pending[f'{id(message)}-{message.meta.id}'] = message
 
         async def retry(channel, message, wait):
             await asyncio.sleep(wait)  # tight loop mitigation
             await self.rqueue.put((channel, message))
 
-        # Schedule push to retry queue to free up caller.
-        asyncio.ensure_future(retry(channel, message, wait))
+        if wait is False:
+            wait = 0.000001
+        if wait is True:
+            if key is None:
+                raise ValueError('Missing key')
+
+            self.node.debug(f'Stashing message {message}')
+            self.backlog[key] = (channel, message)
+        else:
+            if key:
+                channel, message = self.backlog.pop(key)
+            # Schedule push to retry queue to free up caller.
+            self.node.debug(f'Requeuing message {message}')
+            asyncio.ensure_future(retry(channel, message, wait))
 
     __call__ = outfeed
 
