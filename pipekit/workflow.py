@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import sys
 from importlib import import_module
 from inspect import isclass
@@ -321,6 +322,30 @@ class Workflow(Component):
         """Create engine and run workflow."""
         self.engine = ETLEngine(self)
         self.engine.run()
+
+    REFERENCE_RE = re.compile('<([^<>]+)>')
+
+    def expand_refs(self, string):
+        """Return string with "<node.value>" references replaced with actual values."""
+        for ref in self.REFERENCE_RE.findall(string):
+            *node_path, prop = ref.split('.')
+            node = self
+            node_id = []
+            for child in node_path:
+                node_id += [child]
+                for _node in node.children:
+                    if _node.id == '.'.join(node_id):
+                        node = _node
+                        break
+                else:
+                    self.error(f'Cannot find node with id {".".join(node_id)}')
+            settings = node.settings()
+            if prop in settings:
+                string, _ = self.REFERENCE_RE.subn(str(settings[prop]), string)
+            else:
+                raise KeyError(f'Setting "{prop}" missing from {node.id}')
+
+        return string
 
 
 class SubWorkflow(Component):
