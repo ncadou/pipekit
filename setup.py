@@ -13,7 +13,7 @@ install_requires = [
 
 setup(
     name='pipekit',
-    version='0.3.1',
+    version='0.3.2',
     description='Tools for flow-based programming',
     long_description=long_description,
     url='https://github.com/ncadou/pipekit',
