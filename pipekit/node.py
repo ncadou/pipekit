@@ -210,16 +210,16 @@ class ProcessorWrapper:
     async def _input_iter(self):
         wait = self.iwait
         while self.node.running and self.running:
-            input_is_empty = True
+            queues_are_empty = True
             for queue in (self.rqueue, self.iqueue):
                 try:
                     yield queue.get_nowait()
 
-                    input_is_empty = False
+                    queues_are_empty = False
                 except asyncio.QueueEmpty:
                     pass
 
-            if input_is_empty:
+            if queues_are_empty:
                 await asyncio.sleep(wait)
                 if wait < 0.1:
                     wait *= 2
