@@ -328,22 +328,31 @@ class Workflow(Component):
     def expand_refs(self, string):
         """Return string with "<node.value>" references replaced with actual values."""
         for ref in self.REFERENCE_RE.findall(string):
-            *node_path, prop = ref.split('.')
-            node = self
-            node_id = []
-            for child in node_path:
-                node_id += [child]
-                for _node in node.children:
-                    if _node.id == '.'.join(node_id):
-                        node = _node
-                        break
-                else:
-                    self.error(f'Cannot find node with id {".".join(node_id)}')
-            settings = node.settings()
-            if prop in settings:
-                string, _ = self.REFERENCE_RE.subn(str(settings[prop]), string)
+            node_id, prop = ref.split(':', 1)
+            store, *prop = prop.rsplit(':', 1)
+            if not prop:
+                store, prop = 'settings', store
             else:
-                raise KeyError(f'Setting "{prop}" missing from {node.id}')
+                prop = prop[0]
+            if store in {'settings', 'locals'}:
+                store = store
+            else:
+                raise ValueError(f'Data store {store!r} in {string} does not exist')
+
+            try:
+                node = self.get_node(node_id)
+            except Exception:
+                self.exception()
+
+            if store == 'settings':
+                data = node.settings()
+            else:
+                data = node.locals
+
+            if prop in data:
+                string, _ = self.REFERENCE_RE.subn(str(data[prop]), string)
+            else:
+                raise KeyError(f'Reference "{store}:{prop}" missing from {node.id}')
 
         return string
 

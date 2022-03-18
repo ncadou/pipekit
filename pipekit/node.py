@@ -32,6 +32,7 @@ class Node(Component):
         self.blocking = self.__class__ is ThreadedNode or blocking
         self.scale = int(scale or 1)
         self.layers = list()
+        self.locals = Box()
 
         # Used by ProcessorWrapper to control behavior of input feed.
         self.wait_for_pending = True
