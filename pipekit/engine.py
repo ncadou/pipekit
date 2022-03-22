@@ -21,7 +21,11 @@ class ETLEngine:
         loop.run_until_complete(asyncio.gather(*list(
             n.instance.start() for w in self.workflows.values() for n in w.values())))
         _l.info(f'Workflow ended ({self.workflow.source})')
-        for task in asyncio.Task.all_tasks():
+
+        if not loop.is_running():
+            return
+
+        for task in asyncio.all_tasks():
             try:
                 task.get_coro().throw(ComponentInterrupted)
             except (RuntimeError, ComponentInterrupted):
