@@ -323,6 +323,21 @@ class Workflow(Component):
         self.engine = ETLEngine(self)
         self.engine.run()
 
+    def get_node(self, name):
+        """Return string with "<node.value>" references replaced with actual values."""
+        node = self
+        node_id = []
+        for child in name.split('.'):
+            node_id += [child]
+            for _node in node.children:
+                if _node.id == '.'.join(node_id):
+                    node = _node
+                    break
+            else:
+                raise ValueError(f'Cannot find node with id {".".join(node_id)}')
+
+        return node
+
     REFERENCE_RE = re.compile('<([^<>]+)>')
 
     def expand_refs(self, string):
